@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "TradingSignals",
+    "slug": "trading-signals",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#0D1117"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.tradingsignals.app"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0D1117"
+      },
+      "package": "com.tradingsignals.app"
+    },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "color": "#F7931A"
+        }
+      ]
+    ],
+    "scheme": "tradingsignals"
+  }
+}

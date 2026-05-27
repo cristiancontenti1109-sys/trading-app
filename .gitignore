@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+.expo/
+
+# Database
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
