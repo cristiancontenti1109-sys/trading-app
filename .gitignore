@@ -1,24 +1,14 @@
-# Dependencies
-node_modules/
-.venv/
+backend/.venv/
+backend/__pycache__/
+backend/build/
+backend/dist/
+backend/trading.db
+backend/*.db
+backend/.env
 
-# Environment / secrets
-.env
-.env.local
-.env.*.local
+web/node_modules/
+web/dist/
+web/release/
 
-# Build output
-dist/
-build/
-.expo/
-
-# Database
-*.db
-*.sqlite
-
-# OS
+*.pyc
 .DS_Store
-
-# Logs
-*.log
-npm-debug.log*
