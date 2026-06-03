@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -12,7 +13,14 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import init_db, get_db, AsyncSessionLocal
 from app.models import User, Instrument, WatchlistItem
-from app.routers import auth, watchlist, signals, instruments, trades
+from app.routers import auth, watchlist, signals, instruments, trades, chat
+from app.routers import alpaca as alpaca_router
+from app.routers import smc as smc_router
+from app.routers import auto_trading as auto_trading_router
+from app.routers import trend_rr as trend_rr_router
+from app.services.smc_service import generate_smc_signal, smc_signal_to_dict
+from app.services.auto_trading_service import run_morning_scan, run_afternoon_scan, notify_eod_review
+from app.services.trend_rr_service import run_scan as trend_rr_scan, run_eod_scan as trend_rr_eod
 from app.websocket.manager import manager
 from app.services.market_data import fetch_ohlcv, fetch_current_price
 from app.services.signal_service import generate_signal
@@ -28,6 +36,7 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
 INSTRUMENT_CATALOG = [
+    # Crypto
     ("BTCUSD", "Bitcoin / USD", "crypto"),
     ("ETHUSD", "Ethereum / USD", "crypto"),
     ("SOLUSD", "Solana / USD", "crypto"),
@@ -35,6 +44,23 @@ INSTRUMENT_CATALOG = [
     ("XRPUSD", "XRP / USD", "crypto"),
     ("ADAUSD", "Cardano / USD", "crypto"),
     ("DOGEUSD", "Dogecoin / USD", "crypto"),
+    ("AVAXUSD", "Avalanche / USD", "crypto"),
+    ("LINKUSD", "Chainlink / USD", "crypto"),
+    ("DOTUSD", "Polkadot / USD", "crypto"),
+    ("MATICUSD", "Polygon / USD", "crypto"),
+    ("LTCUSD", "Litecoin / USD", "crypto"),
+    ("BCHUSD", "Bitcoin Cash / USD", "crypto"),
+    ("XLMUSD", "Stellar / USD", "crypto"),
+    ("ATOMUSD", "Cosmos / USD", "crypto"),
+    ("NEARUSD", "NEAR Protocol / USD", "crypto"),
+    ("UNIUSD", "Uniswap / USD", "crypto"),
+    ("AAVEUSD", "Aave / USD", "crypto"),
+    ("ALGOUSD", "Algorand / USD", "crypto"),
+    ("TRXUSD", "TRON / USD", "crypto"),
+    ("ETCUSD", "Ethereum Classic / USD", "crypto"),
+    ("SHIBUSD", "Shiba Inu / USD", "crypto"),
+    ("FILUSD", "Filecoin / USD", "crypto"),
+    # Stocks — US Large Cap
     ("AAPL", "Apple Inc.", "stocks"),
     ("MSFT", "Microsoft Corp.", "stocks"),
     ("GOOGL", "Alphabet Inc.", "stocks"),
@@ -43,14 +69,68 @@ INSTRUMENT_CATALOG = [
     ("NVDA", "NVIDIA Corp.", "stocks"),
     ("META", "Meta Platforms", "stocks"),
     ("NFLX", "Netflix Inc.", "stocks"),
+    ("AMD", "Advanced Micro Devices", "stocks"),
+    ("INTC", "Intel Corp.", "stocks"),
+    ("ADBE", "Adobe Inc.", "stocks"),
+    ("CRM", "Salesforce Inc.", "stocks"),
+    ("ORCL", "Oracle Corp.", "stocks"),
+    ("CSCO", "Cisco Systems", "stocks"),
+    ("QCOM", "Qualcomm Inc.", "stocks"),
+    ("IBM", "IBM Corp.", "stocks"),
+    ("JPM", "JPMorgan Chase", "stocks"),
+    ("BAC", "Bank of America", "stocks"),
+    ("GS", "Goldman Sachs", "stocks"),
+    ("WFC", "Wells Fargo", "stocks"),
+    ("V", "Visa Inc.", "stocks"),
+    ("MA", "Mastercard Inc.", "stocks"),
+    ("PYPL", "PayPal Holdings", "stocks"),
+    ("KO", "Coca-Cola Co.", "stocks"),
+    ("PEP", "PepsiCo Inc.", "stocks"),
+    ("WMT", "Walmart Inc.", "stocks"),
+    ("MCD", "McDonald's Corp.", "stocks"),
+    ("SBUX", "Starbucks Corp.", "stocks"),
+    ("NKE", "Nike Inc.", "stocks"),
+    ("DIS", "Walt Disney Co.", "stocks"),
+    ("XOM", "Exxon Mobil Corp.", "stocks"),
+    ("BA", "Boeing Co.", "stocks"),
+    ("UNH", "UnitedHealth Group", "stocks"),
+    ("JNJ", "Johnson & Johnson", "stocks"),
+    ("BABA", "Alibaba Group", "stocks"),
+    ("SHOP", "Shopify Inc.", "stocks"),
+    ("COIN", "Coinbase Global", "stocks"),
+    ("PLTR", "Palantir Technologies", "stocks"),
+    ("UBER", "Uber Technologies", "stocks"),
+    # ETFs
     ("SPY", "SPDR S&P 500 ETF", "stocks"),
+    ("QQQ", "Invesco QQQ (Nasdaq-100)", "stocks"),
+    ("IWM", "iShares Russell 2000 ETF", "stocks"),
+    ("GLD", "SPDR Gold Shares ETF", "stocks"),
+    # Forex — Majors
     ("EURUSD", "EUR / USD", "forex"),
     ("GBPUSD", "GBP / USD", "forex"),
     ("USDJPY", "USD / JPY", "forex"),
     ("AUDUSD", "AUD / USD", "forex"),
+    ("USDCHF", "USD / CHF", "forex"),
+    ("USDCAD", "USD / CAD", "forex"),
+    ("NZDUSD", "NZD / USD", "forex"),
+    # Forex — Crosses
+    ("EURGBP", "EUR / GBP", "forex"),
+    ("EURJPY", "EUR / JPY", "forex"),
+    ("GBPJPY", "GBP / JPY", "forex"),
+    ("EURCHF", "EUR / CHF", "forex"),
+    ("EURCAD", "EUR / CAD", "forex"),
+    ("GBPCAD", "GBP / CAD", "forex"),
+    ("CHFJPY", "CHF / JPY", "forex"),
+    ("AUDCAD", "AUD / CAD", "forex"),
+    ("AUDJPY", "AUD / JPY", "forex"),
+    # Commodities
     ("XAUUSD", "Gold / USD", "commodities"),
     ("XAGUSD", "Silver / USD", "commodities"),
     ("USOIL", "Crude Oil (WTI)", "commodities"),
+    ("NATGAS", "Natural Gas", "commodities"),
+    ("COPPER", "Copper", "commodities"),
+    ("WHEAT", "Wheat", "commodities"),
+    ("CORN", "Corn", "commodities"),
 ]
 
 
@@ -122,6 +202,36 @@ async def notify_hot_signal(db: AsyncSession, symbol: str, signal: dict):
             mark_notification_sent(user.id, symbol, condition)
 
 
+SMC_SCAN_SYMBOLS = [
+    "AAPL", "NVDA", "TSLA", "MSFT", "SPY", "QQQ",
+    "BTCUSD", "ETHUSD", "SOLUSD",
+    "EURUSD", "GBPUSD",
+]
+
+
+async def run_smc_scan():
+    """Scan key symbols for Market Mechanics setups every 15 min and broadcast HOT signals."""
+    logger.info("Running Market Mechanics scan...")
+    for symbol in SMC_SCAN_SYMBOLS:
+        try:
+            df4h  = await fetch_ohlcv(symbol, "4h",  limit=200)
+            df1h  = await fetch_ohlcv(symbol, "1h",  limit=200)
+            df15m = await fetch_ohlcv(symbol, "15m", limit=300)
+            if df4h is None or df15m is None:
+                continue
+            sig = generate_smc_signal(df4h, df15m, symbol, df1h)
+            if sig and sig.smc_score >= 4:
+                payload = smc_signal_to_dict(sig)
+                payload["type"] = "smc_signal"
+                await manager.broadcast_signal(symbol, payload)
+                logger.info(
+                    f"Market Mechanics signal {symbol}: {sig.direction} "
+                    f"score={sig.smc_score}/5 conf={sig.confidence}"
+                )
+        except Exception as e:
+            logger.error(f"SMC scan error {symbol}: {e}")
+
+
 async def run_price_updates():
     """Broadcast latest prices to WebSocket clients."""
     async with AsyncSessionLocal() as db:
@@ -141,6 +251,58 @@ async def lifespan(app: FastAPI):
 
     scheduler.add_job(run_signal_pipeline, "interval", minutes=15, id="signal_pipeline")
     scheduler.add_job(run_price_updates, "interval", seconds=30, id="price_updates")
+    scheduler.add_job(run_smc_scan, "interval", minutes=15, id="smc_scan")
+    # Trend RR — scan every 30 min during US market hours (Mon–Fri 09:35–15:30 ET)
+    # Scans at :05 and :35 past each hour so they don't collide with other jobs
+    for _hour in range(9, 16):
+        _start_min = 35 if _hour == 9 else 5
+        for _min in [_start_min, _start_min + 30]:
+            if _min >= 60 or (_hour == 15 and _min > 30):
+                continue
+            scheduler.add_job(
+                trend_rr_scan, "cron",
+                day_of_week="mon-fri", hour=_hour, minute=_min,
+                timezone="America/New_York",
+                id=f"trend_rr_{_hour:02d}{_min:02d}",
+            )
+    # EOD position review at 15:45 ET
+    scheduler.add_job(
+        trend_rr_eod, "cron",
+        day_of_week="mon-fri", hour=15, minute=45,
+        timezone="America/New_York",
+        id="trend_rr_eod",
+    )
+
+    # Auto-trading schedule (US Eastern Time)
+    scheduler.add_job(
+        run_morning_scan, "cron",
+        hour=9, minute=35, timezone="America/New_York",
+        id="auto_morning_scan",
+    )
+    scheduler.add_job(
+        run_afternoon_scan, "cron",
+        hour=15, minute=15, timezone="America/New_York",
+        id="auto_afternoon_scan",
+    )
+    scheduler.add_job(
+        notify_eod_review, "cron",
+        hour=15, minute=45, timezone="America/New_York",
+        id="auto_eod_notify",
+    )
+
+    # Keep-alive ping — prevents Render free tier from sleeping
+    async def _self_ping():
+        import aiohttp
+        host = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8080")
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.get(f"{host}/health", timeout=aiohttp.ClientTimeout(total=10))
+            logger.debug("keep-alive ping OK")
+        except Exception as e:
+            logger.debug(f"keep-alive ping: {e}")
+
+    scheduler.add_job(_self_ping, "interval", minutes=10, id="keep_alive")
+
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -168,6 +330,11 @@ app.include_router(watchlist.router)
 app.include_router(signals.router)
 app.include_router(instruments.router)
 app.include_router(trades.router)
+app.include_router(chat.router)
+app.include_router(alpaca_router.router)
+app.include_router(smc_router.router)
+app.include_router(auto_trading_router.router)
+app.include_router(trend_rr_router.router)
 
 
 @app.get("/health")

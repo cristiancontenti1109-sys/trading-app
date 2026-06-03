@@ -3,7 +3,8 @@ import axios from 'axios'
 import { createChart, CandlestickSeries, createSeriesMarkers } from 'lightweight-charts'
 import './App.css'
 
-const api = axios.create({ baseURL: 'http://localhost:8000' })
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8001'
+const api = axios.create({ baseURL: API_BASE })
 api.interceptors.request.use((c) => {
   const t = localStorage.getItem('token')
   if (t) c.headers.Authorization = `Bearer ${t}`
@@ -14,8 +15,9 @@ type Rec = 'BUY' | 'SELL' | 'HOLD'
 interface Signal {
   symbol: string; timeframe: string; recommendation: Rec; confidence: number
   entry_zone: { low: number; high: number }; target_price: number; stop_loss: number
+  tp1?: number; tp2?: number; tp3?: number
   reasoning: string[]; is_hot: boolean; is_hot_confluence: boolean
-  indicators?: { rsi: number; macd: number; adx: number; vol_zscore: number; bb_pct_b: number }
+  indicators?: { rsi: number; macd: number; adx: number; vol_zscore: number; bb_pct_b: number; bull_gates?: number; bear_gates?: number }
 }
 interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
 interface WatchItem { symbol: string; name: string; asset_class: string }
@@ -30,9 +32,63 @@ interface TradeStats { total: number; wins: number; losses: number; win_rate: nu
 interface SignalHistItem { recommendation: Rec; confidence: number; created_at: string }
 interface NewsItem { title: string; publisher: string; url: string; time: number }
 
-const REC_COLOR: Record<Rec, string> = { BUY: '#00C896', SELL: '#FF4560', HOLD: '#F7931A' }
-const ASSET_COLOR: Record<string, string> = { crypto: '#F7931A', stocks: '#58A6FF', forex: '#3FB950', commodities: '#D2A679' }
+interface LabParams {
+  fast_ema: number; slow_ema: number; rsi_period: number
+  rsi_oversold: number; rsi_overbought: number
+  require_macd: boolean; require_volume: boolean; atr_multiplier: number
+}
+interface ChatMsg { role: 'user' | 'ai'; text: string; time: number }
+
+type StrategyKey = 'fibonacci' | 'smart_money' | 'elliott_wave' | 'warren_buffett' | 'jpmorgan'
+  | 'macd_crossover' | 'rsi_divergence' | 'bb_squeeze' | 'support_resistance'
+  | 'ema_crossover' | 'ichimoku' | 'stochastic' | 'vwap'
+
+interface StrategyResult {
+  strategy: StrategyKey; recommendation: Rec; confidence: number
+  entry_zone: { low: number; high: number }; target_price: number; stop_loss: number
+  tp1?: number; tp2?: number; tp3?: number
+  reasoning: string[]
+  fib_levels?: Record<string, number>; closest_level?: string; trend?: string
+  zones?: { type: string; high: number; low: number; label: string }[]
+  structure?: string
+  wave_label?: string; pivots?: { type: string; price: number }[]
+  scores?: { quality: number; value: number; total: number }; key_levels?: Record<string, number>
+  factors?: Record<string, number>; composite_score?: number
+}
+
+const REC_COLOR: Record<Rec, string> = { BUY: '#10B981', SELL: '#EF4444', HOLD: '#F59E0B' }
+const ASSET_COLOR: Record<string, string> = { crypto: '#F7931A', stocks: '#3B82F6', forex: '#10B981', commodities: '#D2A679' }
 const TFS = ['15m', '1h', '4h', '1D', '1W']
+
+const STRATEGIES: { key: StrategyKey; label: string; desc: string; category: string }[] = [
+  { key: 'fibonacci',          label: 'Fibonacci',           desc: 'Retracements & extensions from swing pivots',      category: 'Price Action' },
+  { key: 'smart_money',        label: 'Smart Money (SMC)',    desc: 'Order blocks, FVGs, liquidity sweeps',             category: 'Price Action' },
+  { key: 'elliott_wave',       label: 'Elliott Wave',         desc: 'Impulse & corrective wave count',                  category: 'Price Action' },
+  { key: 'support_resistance', label: 'Support / Resistance', desc: 'Key price cluster levels from swing highs/lows',   category: 'Price Action' },
+  { key: 'ema_crossover',      label: 'EMA Crossover',        desc: 'Golden Cross / Death Cross & ribbon',              category: 'Trend' },
+  { key: 'ichimoku',           label: 'Ichimoku Cloud',       desc: 'Full Ichimoku: cloud, Tenkan/Kijun, Chikou',       category: 'Trend' },
+  { key: 'vwap',               label: 'VWAP',                 desc: 'Volume-weighted price deviation & EMA confluence', category: 'Trend' },
+  { key: 'macd_crossover',     label: 'MACD Crossover',       desc: 'Crossover, histogram momentum & divergence',       category: 'Momentum' },
+  { key: 'rsi_divergence',     label: 'RSI Divergence',       desc: 'Regular bullish/bearish divergence detection',     category: 'Momentum' },
+  { key: 'stochastic',         label: 'Stochastic',           desc: '%K/%D crossover in oversold/overbought zones',     category: 'Momentum' },
+  { key: 'bb_squeeze',         label: 'BB Squeeze',           desc: 'Bollinger Band squeeze & breakout detection',      category: 'Volatility' },
+  { key: 'warren_buffett',     label: 'Warren Buffett',       desc: 'Quality + value long-term filter',                 category: 'Institutional' },
+  { key: 'jpmorgan',           label: 'JPMorgan Quant',       desc: 'Multi-factor momentum & mean-reversion',           category: 'Institutional' },
+]
+
+const FIB_COLORS: Record<string, string> = {
+  '23.6%': '#8B949E', '38.2%': '#F7931A', '50.0%': '#FFCC00',
+  '61.8%': '#10B981', '78.6%': '#3B82F6', '100.0%': '#EF4444',
+}
+
+function fillTPs<T extends { recommendation: Rec; target_price: number; stop_loss: number; tp1?: number; tp2?: number; tp3?: number }>(sig: T): T {
+  if (sig.tp1 != null || sig.recommendation === 'HOLD') return sig
+  const { recommendation: rec, target_price: tp2val, stop_loss } = sig
+  const stopDist = rec === 'BUY' ? (tp2val - stop_loss) / 4.0 : (stop_loss - tp2val) / 4.0
+  const close = rec === 'BUY' ? stop_loss + stopDist : stop_loss - stopDist
+  const dir = rec === 'BUY' ? 1 : -1
+  return { ...sig, tp1: close + dir * 1.5 * stopDist, tp2: tp2val, tp3: close + dir * 4.5 * stopDist }
+}
 
 function playHotAlert() {
   try {
@@ -78,7 +134,6 @@ function buildNarrative(signal: Signal, symbol: string): string[] {
   const bias = rec === 'BUY' ? 'bullish' : rec === 'SELL' ? 'bearish' : 'neutral'
   const strength = pct > 75 ? 'strong' : pct > 60 ? 'moderate' : 'developing'
   const paras: string[] = []
-
   paras.push(
     `The ${timeframe} analysis of ${symbol} shows a ${strength} ${bias} setup with ${pct}% model confidence. ` +
     (rec === 'BUY'
@@ -87,33 +142,21 @@ function buildNarrative(signal: Signal, symbol: string): string[] {
       ? `Price structure favours a short entry in the zone ${fmt(entry_zone.low)}–${fmt(entry_zone.high)}, targeting ${fmt(target_price)} with stop at ${fmt(stop_loss)}.`
       : `No clear directional edge is present — the model recommends staying flat until a cleaner setup appears.`)
   )
-
   if (ind) {
     const parts: string[] = []
-    if (ind.rsi >= 80) parts.push(`RSI at ${ind.rsi.toFixed(0)} is overbought — upside momentum is stretched and a pullback is possible`)
-    else if (ind.rsi >= 60) parts.push(`RSI at ${ind.rsi.toFixed(0)} sits in the bullish zone, confirming that buyers remain in control`)
-    else if (ind.rsi <= 20) parts.push(`RSI at ${ind.rsi.toFixed(0)} is deeply oversold, suggesting a potential mean-reversion bounce`)
+    if (ind.rsi >= 80) parts.push(`RSI at ${ind.rsi.toFixed(0)} is overbought`)
+    else if (ind.rsi >= 60) parts.push(`RSI at ${ind.rsi.toFixed(0)} sits in the bullish zone`)
+    else if (ind.rsi <= 20) parts.push(`RSI at ${ind.rsi.toFixed(0)} is deeply oversold`)
     else if (ind.rsi <= 40) parts.push(`RSI at ${ind.rsi.toFixed(0)} reflects sustained selling pressure`)
-    else parts.push(`RSI at ${ind.rsi.toFixed(0)} is neutral — no momentum extreme`)
-
-    if (ind.adx >= 30) parts.push(`ADX at ${ind.adx.toFixed(0)} confirms a strong, well-established trend`)
-    else if (ind.adx >= 20) parts.push(`ADX at ${ind.adx.toFixed(0)} shows the trend is gaining traction but still developing`)
-    else parts.push(`ADX at ${ind.adx.toFixed(0)} indicates a weak or ranging market — breakout not yet confirmed`)
-
-    if (ind.bb_pct_b > 0.85) parts.push(`price is pressing against the upper Bollinger Band (%B ${ind.bb_pct_b.toFixed(2)}), signalling overextension`)
-    else if (ind.bb_pct_b < 0.15) parts.push(`price is hugging the lower Bollinger Band (%B ${ind.bb_pct_b.toFixed(2)}), a historically oversold zone`)
-
-    if (ind.vol_zscore > 2) parts.push(`volume is surging ${ind.vol_zscore.toFixed(1)}σ above its 20-period average, giving the move strong institutional conviction`)
-    else if (ind.vol_zscore > 1) parts.push(`volume is moderately elevated (${ind.vol_zscore.toFixed(1)}σ), providing some confidence in the direction`)
-    else parts.push(`volume is below average — this move lacks broad participation and could fade`)
-
+    else parts.push(`RSI at ${ind.rsi.toFixed(0)} is neutral`)
+    if (ind.adx >= 30) parts.push(`ADX at ${ind.adx.toFixed(0)} confirms a strong trend`)
+    else if (ind.adx >= 20) parts.push(`ADX at ${ind.adx.toFixed(0)} shows trend gaining traction`)
+    else parts.push(`ADX at ${ind.adx.toFixed(0)} indicates a ranging market`)
+    if (ind.vol_zscore > 2) parts.push(`volume surging ${ind.vol_zscore.toFixed(1)}σ above average`)
+    else if (ind.vol_zscore < 0.5) parts.push(`volume below average — move lacks broad participation`)
     if (parts.length) paras.push(parts.join('. ') + '.')
   }
-
-  if (reasoning.length) {
-    paras.push(`Key technical confluences: ${reasoning.join('; ')}.`)
-  }
-
+  if (reasoning.length) paras.push(`Key confluences: ${reasoning.join('; ')}.`)
   return paras
 }
 
@@ -132,22 +175,83 @@ export default function App() {
   const [candles, setCandles] = useState<Candle[]>([])
   const [signalHistory, setSignalHistory] = useState<SignalHistItem[]>([])
   const [news, setNews] = useState<NewsItem[]>([])
+  const [activeStrategy, setActiveStrategy] = useState<StrategyKey | null>(null)
+  const [strategyResult, setStrategyResult] = useState<StrategyResult | null>(null)
+  const [strategyLoading, setStrategyLoading] = useState(false)
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [searchResults, setSearchResults] = useState<WatchItem[]>([])
+  const [addError, setAddError] = useState('')
+  const [lastPriceUpdate, setLastPriceUpdate] = useState<number | null>(null)
   const [sideTab, setSideTab] = useState<'watchlist' | 'search'>('watchlist')
-
-  const [mainView, setMainView] = useState<'signals' | 'journal'>('signals')
+  const [mainView, setMainView] = useState<'signals' | 'journal' | 'chat' | 'lab' | 'trendrr'>('signals')
   const [trades, setTrades] = useState<Trade[]>([])
   const [tradeStats, setTradeStats] = useState<TradeStats | null>(null)
   const [journalSub, setJournalSub] = useState<'open' | 'closed' | 'new'>('open')
   const [newTrade, setNewTrade] = useState({ symbol: '', direction: 'BUY', entry_price: '', size: '1', notes: '' })
   const [closeForm, setCloseForm] = useState<{ id: string; exit_price: string } | null>(null)
 
+  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([])
+  const [chatInput, setChatInput] = useState('')
+  const [chatLoading, setChatLoading] = useState(false)
+  const [labParams, setLabParams] = useState<LabParams>({
+    fast_ema: 9, slow_ema: 21, rsi_period: 14,
+    rsi_oversold: 30, rsi_overbought: 70,
+    require_macd: true, require_volume: false, atr_multiplier: 1.5,
+  })
+  const [labResult, setLabResult] = useState<StrategyResult | null>(null)
+  const [labLoading, setLabLoading] = useState(false)
+  const [labDescription, setLabDescription] = useState('')
+  const [labAnalysis, setLabAnalysis] = useState<{ explanation: string; rationale: string } | null>(null)
+  const [labAnalysisLoading, setLabAnalysisLoading] = useState(false)
+
+  // ── Trend RR state ──────────────────────────────────────────────────────────
+  interface TrendRRTrade {
+    symbol: string; order_id: string; entry_price: number; stop_loss: number
+    take_profit: number; qty: number; atr: number; entered_at: string
+    exit_notified: boolean; current_price: number | null
+    unrealized_pnl: number | null; unrealized_pnl_pct: number | null
+  }
+  interface TrendRRStatus {
+    strategy: string; active_trades: number
+    market_open: boolean; current_time_et: string; trades_opened_today: number
+    config: {
+      risk_pct: number; atr_sl_multiplier: number; rr_ratio: number
+      ema_period: number; rsi_period: number; rsi_trigger: number
+      scan_universe: string[]; timeframe: string
+    }
+    trades: TrendRRTrade[]
+  }
+  const [trendRR, setTrendRR] = useState<TrendRRStatus | null>(null)
+  const [trendRRLoading, setTrendRRLoading] = useState(false)
+  const [trendRRScanning, setTrendRRScanning] = useState(false)
+
+  const loadTrendRR = useCallback(async () => {
+    setTrendRRLoading(true)
+    try { setTrendRR((await api.get('/trend-rr/status')).data) } catch {}
+    setTrendRRLoading(false)
+  }, [])
+
+  const triggerTrendRRScan = async () => {
+    setTrendRRScanning(true)
+    try { await api.post('/trend-rr/scan') } catch {}
+    setTimeout(() => { loadTrendRR(); setTrendRRScanning(false) }, 2000)
+  }
+
+  const closeTrendRRTrade = async (symbol: string) => {
+    try { await api.post(`/trend-rr/close/${symbol}`); await loadTrendRR() } catch {}
+  }
+
+  useEffect(() => { if (mainView === 'trendrr') loadTrendRR() }, [mainView, loadTrendRR])
+
   const chartRef = useRef<HTMLDivElement>(null)
   const chartInstance = useRef<ReturnType<typeof createChart> | null>(null)
+  const chatEndRef = useRef<HTMLDivElement>(null)
+  const [signalAge, setSignalAge] = useState<number | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const signalLoadTrigger = useRef(0)
 
-  // ---- loaders ----
   const loadWatchlist = useCallback(async () => {
     try { setWatchlist((await api.get('/watchlist/')).data) } catch {}
   }, [])
@@ -161,126 +265,142 @@ export default function App() {
 
   useEffect(() => { if (token) { loadWatchlist(); loadTrades() } }, [token, loadWatchlist, loadTrades])
 
-  // ---- live price polling ----
+  const pollPrices = useCallback(async (symbols: string[]) => {
+    if (!symbols.length) return
+    try {
+      const { data } = await api.get('/instruments/prices', { params: { symbols: symbols.join(',') } })
+      if (data && typeof data === 'object') {
+        setLivePrices(prev => ({ ...prev, ...data }))
+        setLastPriceUpdate(Date.now())
+      }
+    } catch {}
+  }, [])
+
   useEffect(() => {
     if (!token || watchlist.length === 0) return
-    const poll = async () => {
-      const updates: Record<string, number> = {}
-      await Promise.allSettled(watchlist.map(async (item) => {
-        try {
-          const { data } = await api.get(`/instruments/${item.symbol}/price`)
-          updates[item.symbol] = data.price
-        } catch {}
-      }))
-      if (Object.keys(updates).length) setLivePrices(prev => ({ ...prev, ...updates }))
-    }
-    poll()
-    const id = setInterval(poll, 30000)
+    const symbols = watchlist.map(w => w.symbol)
+    pollPrices(symbols)
+    const id = setInterval(() => pollPrices(symbols), 15000)
     return () => clearInterval(id)
-  }, [token, watchlist])
+  }, [token, watchlist, pollPrices])
 
-  // ---- search ----
   useEffect(() => {
-    if (!search.trim()) { setSearchResults([]); return }
+    if (!search.trim()) { setSearchResults([]); setAddError(''); return }
     const id = setTimeout(async () => {
       try { setSearchResults((await api.get('/watchlist/search', { params: { q: search } })).data) } catch {}
     }, 300)
     return () => clearTimeout(id)
   }, [search])
 
-  // ---- signal + OHLCV + history + news ----
+  const loadSignalData = useCallback((sym: string, timeframe: string, isRefresh = false) => {
+    if (isRefresh) setRefreshing(true); else setLoading(true)
+    if (!isRefresh) { setSignal(null); setCandles([]); setSignalHistory([]); setNews([]) }
+    Promise.all([
+      api.get(`/signals/${sym}`, { params: { timeframe } }),
+      api.get(`/signals/${sym}/ohlcv`, { params: { timeframe, limit: 150 } }),
+      api.get(`/signals/${sym}/history`, { params: { timeframe, limit: 50 } }).catch(() => ({ data: [] })),
+      api.get(`/signals/${sym}/news`).catch(() => ({ data: { news: [] } })),
+    ]).then(([s, o, h, n]) => {
+      setSignal(fillTPs(s.data)); setCandles(o.data.candles)
+      setSignalHistory(h.data); setNews(n.data.news ?? [])
+      setSignalAge(Date.now())
+      if (s.data.is_hot) playHotAlert()
+    }).catch(() => {}).finally(() => { setLoading(false); setRefreshing(false) })
+  }, [])
+
   useEffect(() => {
     if (!selected || !token) return
-    setLoading(true); setSignal(null); setCandles([]); setSignalHistory([]); setNews([])
-    Promise.all([
-      api.get(`/signals/${selected}`, { params: { timeframe: tf } }),
-      api.get(`/signals/${selected}/ohlcv`, { params: { timeframe: tf, limit: 150 } }),
-      api.get(`/signals/${selected}/history`, { params: { timeframe: tf, limit: 50 } }).catch(() => ({ data: [] })),
-      api.get(`/signals/${selected}/news`).catch(() => ({ data: { news: [] } })),
-    ]).then(([s, o, h, n]) => {
-      setSignal(s.data)
-      setCandles(o.data.candles)
-      setSignalHistory(h.data)
-      setNews(n.data.news ?? [])
-      if (s.data.is_hot) playHotAlert()
-    }).catch(() => {}).finally(() => setLoading(false))
-  }, [selected, tf, token])
+    loadSignalData(selected, tf)
+  }, [selected, tf, token, loadSignalData])
 
-  // ---- candlestick chart + markers ----
+  // Auto-refresh signal + chart every 5 minutes
+  useEffect(() => {
+    if (!selected || !token) return
+    const id = setInterval(() => {
+      loadSignalData(selected, tf, true)
+    }, 5 * 60 * 1000)
+    return () => clearInterval(id)
+  }, [selected, tf, token, loadSignalData])
+
+  useEffect(() => {
+    if (!activeStrategy || !selected || !token) { setStrategyResult(null); return }
+    setStrategyLoading(true); setStrategyResult(null)
+    api.get(`/signals/${selected}/strategy`, { params: { strategy: activeStrategy, timeframe: tf } })
+      .then(r => setStrategyResult(fillTPs(r.data)))
+      .catch(() => {})
+      .finally(() => setStrategyLoading(false))
+  }, [activeStrategy, selected, tf, token])
+
+  useEffect(() => { setActiveStrategy(null); setStrategyResult(null) }, [selected])
+
+  // Unified display: strategy result takes priority over general signal
+  const displayData = activeStrategy && strategyResult ? strategyResult : signal ? fillTPs(signal) : null
+  const currentStrategyInfo = STRATEGIES.find(s => s.key === activeStrategy)
+
   useEffect(() => {
     if (!chartRef.current || candles.length === 0) return
-
     if (chartInstance.current) { chartInstance.current.remove(); chartInstance.current = null }
 
     const chart = createChart(chartRef.current, {
-      width: chartRef.current.clientWidth,
-      height: 300,
-      layout: { background: { color: '#161B22' }, textColor: '#8B949E' },
-      grid: { vertLines: { color: '#21262D' }, horzLines: { color: '#21262D' } },
-      timeScale: { borderColor: '#30363D', timeVisible: true },
-      rightPriceScale: { borderColor: '#30363D' },
+      width: chartRef.current.clientWidth, height: 400,
+      layout: { background: { color: '#080C14' }, textColor: '#94A3B8' },
+      grid: { vertLines: { color: '#111827' }, horzLines: { color: '#111827' } },
+      timeScale: { borderColor: '#1E2D45', timeVisible: true },
+      rightPriceScale: { borderColor: '#1E2D45' },
     })
 
     const series = chart.addSeries(CandlestickSeries, {
-      upColor: '#00C896', downColor: '#FF4560',
-      borderVisible: false,
-      wickUpColor: '#00C896', wickDownColor: '#FF4560',
+      upColor: '#10B981', downColor: '#EF4444', borderVisible: false,
+      wickUpColor: '#10B981', wickDownColor: '#EF4444',
     })
 
-    series.setData(candles.map(c => ({
-      time: c.time as any, open: c.open, high: c.high, low: c.low, close: c.close,
-    })))
+    series.setData(candles.map(c => ({ time: c.time as any, open: c.open, high: c.high, low: c.low, close: c.close })))
 
-    // Build buy/sell markers from signal history
     const candleTimes = candles.map(c => c.time)
-    const seen = new Set<number>()
-    const markers: any[] = []
-
-    // Collect history markers (oldest first so they render in order)
-    const sorted = [...signalHistory].reverse()
-    for (const h of sorted) {
+    const dedupedMap = new Map<number, any>()
+    for (const h of [...signalHistory].reverse()) {
       if (h.recommendation === 'HOLD') continue
-      const sigTime = Math.floor(new Date(h.created_at).getTime() / 1000)
-      const snapped = snapToCandle(sigTime, candleTimes)
-      // Deduplicate: keep latest if two signals snap to same candle
-      seen.has(snapped) ? null : seen.add(snapped)
-      markers.push({
+      const snapped = snapToCandle(Math.floor(new Date(h.created_at).getTime() / 1000), candleTimes)
+      dedupedMap.set(snapped, {
         time: snapped as any,
         position: h.recommendation === 'BUY' ? 'belowBar' : 'aboveBar',
-        color: h.recommendation === 'BUY' ? '#00C896' : '#FF4560',
+        color: h.recommendation === 'BUY' ? '#10B981' : '#EF4444',
         shape: h.recommendation === 'BUY' ? 'arrowUp' : 'arrowDown',
-        text: `${h.recommendation} ${Math.round(h.confidence * 100)}%`,
-        size: 1,
+        text: `${h.recommendation} ${Math.round(h.confidence * 100)}%`, size: 2,
       })
     }
-
-    // Deduplicate by snapped time (keep last per time)
-    const dedupedMap = new Map<number, any>()
-    for (const m of markers) dedupedMap.set(m.time, m)
     createSeriesMarkers(series, [...dedupedMap.values()].sort((a, b) => a.time - b.time))
-
     chart.timeScale().fitContent()
     chartInstance.current = chart
 
+    // Fibonacci overlays
+    if (activeStrategy === 'fibonacci' && strategyResult?.fib_levels) {
+      for (const [label, price] of Object.entries(strategyResult.fib_levels)) {
+        const short = label.replace('.0%', '%')
+        series.createPriceLine({ price, color: FIB_COLORS[short] ?? '#8B949E', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: `Fib ${short}` })
+      }
+    }
+
+    // SL + TP1 only — TP2/TP3 are far from current price and force the chart to zoom out
+    const src = activeStrategy && strategyResult ? strategyResult : signal
+    if (src && src.recommendation !== 'HOLD') {
+      series.createPriceLine({ price: src.stop_loss, color: '#EF4444', lineWidth: 2, lineStyle: 1, axisLabelVisible: true, title: 'SL' })
+      const tp1 = src.tp1
+      if (tp1 != null) series.createPriceLine({ price: tp1, color: '#10B981', lineWidth: 2, lineStyle: 1, axisLabelVisible: true, title: 'TP1 · 1.5R' })
+    }
+
     const ro = new ResizeObserver(() => {
-      if (chartRef.current && chartInstance.current)
-        chartInstance.current.applyOptions({ width: chartRef.current.clientWidth })
+      if (chartRef.current && chartInstance.current) chartInstance.current.applyOptions({ width: chartRef.current.clientWidth })
     })
     ro.observe(chartRef.current)
+    return () => { ro.disconnect(); if (chartInstance.current) { chartInstance.current.remove(); chartInstance.current = null } }
+  }, [candles, signal, signalHistory, activeStrategy, strategyResult])
 
-    return () => {
-      ro.disconnect()
-      if (chartInstance.current) { chartInstance.current.remove(); chartInstance.current = null }
-    }
-  }, [candles, signalHistory])
-
-  // ---- auth ----
   const handleAuth = async () => {
     setAuthError('')
     try {
       if (authMode === 'login') {
-        const form = new FormData()
-        form.append('username', email); form.append('password', password)
+        const form = new FormData(); form.append('username', email); form.append('password', password)
         const { data } = await api.post('/auth/login', form)
         localStorage.setItem('token', data.access_token); setToken(data.access_token)
       } else {
@@ -290,19 +410,11 @@ export default function App() {
     } catch (e: any) { setAuthError(e.response?.data?.detail || 'Authentication failed') }
   }
 
-  // ---- trade actions ----
   const createTrade = async () => {
     if (!newTrade.symbol || !newTrade.entry_price) return
     try {
-      await api.post('/trades/', {
-        symbol: newTrade.symbol.toUpperCase(),
-        direction: newTrade.direction,
-        entry_price: parseFloat(newTrade.entry_price),
-        size: parseFloat(newTrade.size) || 1,
-        notes: newTrade.notes || null,
-      })
-      setNewTrade({ symbol: '', direction: 'BUY', entry_price: '', size: '1', notes: '' })
-      setJournalSub('open'); loadTrades()
+      await api.post('/trades/', { symbol: newTrade.symbol.toUpperCase(), direction: newTrade.direction, entry_price: parseFloat(newTrade.entry_price), size: parseFloat(newTrade.size) || 1, notes: newTrade.notes || null })
+      setNewTrade({ symbol: '', direction: 'BUY', entry_price: '', size: '1', notes: '' }); setJournalSub('open'); loadTrades()
     } catch {}
   }
 
@@ -315,13 +427,54 @@ export default function App() {
     try { await api.delete(`/trades/${id}`); loadTrades() } catch {}
   }
 
-  // ---- login page ----
+  const sendChat = async (override?: string) => {
+    const msg = override ?? chatInput.trim()
+    if (!msg || chatLoading) return
+    setChatInput('')
+    setChatMessages(prev => [...prev, { role: 'user', text: msg, time: Date.now() }])
+    setChatLoading(true)
+    try {
+      const { data } = await api.post('/chat/', {
+        message: msg, symbol: selected, timeframe: tf, signal: signal, news,
+      })
+      setChatMessages(prev => [...prev, { role: 'ai', text: data.reply, time: Date.now() }])
+    } catch {
+      setChatMessages(prev => [...prev, { role: 'ai', text: 'Connection error — please try again.', time: Date.now() }])
+    } finally {
+      setChatLoading(false)
+    }
+  }
+
+  const runLab = async () => {
+    if (!selected) return
+    setLabLoading(true); setLabResult(null)
+    try {
+      const { data } = await api.post(`/signals/${selected}/custom?timeframe=${tf}`, labParams)
+      setLabResult(fillTPs(data))
+    } catch {} finally { setLabLoading(false) }
+  }
+
+  const analyzeLabStrategy = async () => {
+    if (!labDescription.trim()) return
+    setLabAnalysisLoading(true); setLabAnalysis(null)
+    try {
+      const { data } = await api.post('/chat/strategy', { description: labDescription, symbol: selected })
+      // Apply suggested params to sliders
+      if (data.params) setLabParams(data.params)
+      setLabAnalysis({ explanation: data.explanation || '', rationale: data.rationale || '' })
+    } catch {
+      setLabAnalysis({ explanation: 'Could not analyze strategy. Please try again.', rationale: '' })
+    } finally { setLabAnalysisLoading(false) }
+  }
+
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [chatMessages])
+
   if (!token) return (
     <div className="auth-page">
       <div className="auth-box">
-        <div style={{ fontSize: 56, marginBottom: 8 }}>📈</div>
-        <h1 style={{ margin: '0 0 4px', color: '#E6EDF3' }}>TradingSignals</h1>
-        <p style={{ color: '#8B949E', marginBottom: 32 }}>AI-powered signals for every market</p>
+        <div className="auth-logo">TS</div>
+        <h1>TradingSignals</h1>
+        <p className="auth-sub">AI-powered signals for every market</p>
         <input className="input" placeholder="Email" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleAuth()} />
         <input className="input" placeholder="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleAuth()} />
         {authError && <div className="error-msg">{authError}</div>}
@@ -329,7 +482,7 @@ export default function App() {
         <button className="btn-link" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>
           {authMode === 'login' ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
         </button>
-        <p style={{ color: '#484F58', fontSize: 11, marginTop: 24 }}>Not financial advice. For informational purposes only.</p>
+        <p className="auth-disclaimer">Not financial advice. For informational purposes only.</p>
       </div>
     </div>
   )
@@ -339,27 +492,36 @@ export default function App() {
 
   return (
     <div className="layout">
-      {/* ---- sidebar ---- */}
       <aside className="sidebar">
         <div className="sidebar-header">
-          <span style={{ fontWeight: 700, color: '#E6EDF3' }}>📈 TradingSignals</span>
+          <div className="sidebar-brand"><span className="brand-mark">TS</span> TradingSignals</div>
           <button className="btn-link" style={{ fontSize: 12 }} onClick={() => { localStorage.removeItem('token'); setToken(null) }}>Logout</button>
         </div>
         <div className="tab-row">
           <button className={`tab ${sideTab === 'watchlist' ? 'active' : ''}`} onClick={() => setSideTab('watchlist')}>Watchlist</button>
           <button className={`tab ${sideTab === 'search' ? 'active' : ''}`} onClick={() => setSideTab('search')}>+ Add</button>
         </div>
-
+        {sideTab === 'watchlist' && lastPriceUpdate && (
+          <div className="price-update-hint">Prices updated {timeAgo(Math.floor(lastPriceUpdate / 1000))}</div>
+        )}
         {sideTab === 'search' ? (
           <div style={{ padding: '8px 12px' }}>
             <input className="input" style={{ marginBottom: 8 }} placeholder="BTC, AAPL, EUR..." value={search} onChange={e => setSearch(e.target.value)} autoFocus />
+            {addError && <div className="add-error">{addError}</div>}
             {searchResults.map(r => (
-              <div key={r.symbol} className="list-row" style={{ cursor: 'pointer' }} onClick={async () => {
-                try { await api.post('/watchlist/', { symbol: r.symbol }); loadWatchlist(); setSideTab('watchlist') } catch {}
+              <div key={r.symbol} className="list-row" onClick={async () => {
+                try {
+                  await api.post('/watchlist/', { symbol: r.symbol })
+                  setAddError(''); loadWatchlist(); setSideTab('watchlist')
+                } catch (e: any) {
+                  const msg = e.response?.data?.detail || 'Could not add instrument'
+                  setAddError(msg)
+                  setTimeout(() => setAddError(''), 4000)
+                }
               }}>
                 <span className="dot" style={{ background: ASSET_COLOR[r.asset_class] }} />
                 <div style={{ flex: 1 }}><div className="sym">{r.symbol}</div><div className="label-sm">{r.name}</div></div>
-                <span style={{ color: '#58A6FF', fontSize: 18 }}>+</span>
+                <span className="add-btn">+</span>
               </div>
             ))}
           </div>
@@ -371,11 +533,11 @@ export default function App() {
                 onClick={() => { setSelected(item.symbol); setMainView('signals') }}>
                 <span className="dot" style={{ background: ASSET_COLOR[item.asset_class] }} />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 4 }}>
-                    <div className="sym">{item.symbol}</div>
-                    {livePrices[item.symbol] != null && <div className="live-price">{fmt(livePrices[item.symbol])}</div>}
+                  <div className="sym-row">
+                    <span className="sym">{item.symbol}</span>
+                    {livePrices[item.symbol] != null && <span className="live-price">{fmt(livePrices[item.symbol])}</span>}
                   </div>
-                  <div className="label-sm" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.name}</div>
+                  <div className="label-sm">{item.name}</div>
                 </div>
                 <button className="btn-remove" onClick={async e => { e.stopPropagation(); await api.delete(`/watchlist/${item.symbol}`); loadWatchlist() }}>×</button>
               </div>
@@ -384,130 +546,301 @@ export default function App() {
         )}
       </aside>
 
-      {/* ---- main ---- */}
       <main className="main">
         <div className="main-tabs">
-          <button className={`main-tab ${mainView === 'signals' ? 'active' : ''}`} onClick={() => setMainView('signals')}>📊 Signals</button>
+          <button className={`main-tab ${mainView === 'signals' ? 'active' : ''}`} onClick={() => setMainView('signals')}>Signals</button>
+          <button className={`main-tab ${mainView === 'lab' ? 'active' : ''}`} onClick={() => setMainView('lab')}>Strategy Lab</button>
+          <button className={`main-tab ${mainView === 'chat' ? 'active' : ''}`} onClick={() => setMainView('chat')}>AI Chat</button>
           <button className={`main-tab ${mainView === 'journal' ? 'active' : ''}`} onClick={() => { setMainView('journal'); loadTrades() }}>
-            📓 Journal {openTrades.length > 0 && <span className="badge-count">{openTrades.length}</span>}
+            Journal {openTrades.length > 0 && <span className="badge-count">{openTrades.length}</span>}
+          </button>
+          <button className={`main-tab ${mainView === 'trendrr' ? 'active' : ''}`} onClick={() => setMainView('trendrr')}>
+            Trend RR {trendRR && trendRR.active_trades > 0 && <span className="badge-count">{trendRR.active_trades}</span>}
           </button>
         </div>
 
-        {/* ===== SIGNALS ===== */}
         {mainView === 'signals' && (
           !selected ? (
             <div className="empty-state">
-              <div style={{ fontSize: 64 }}>📊</div>
+              <div className="empty-icon" />
               <h2>Select an instrument</h2>
-              <p>Pick something from your watchlist to see the AI signal</p>
+              <p>Pick an asset from your watchlist to view the AI signal</p>
             </div>
           ) : loading ? (
-            <div className="empty-state"><div className="spinner" /><p style={{ color: '#8B949E', marginTop: 16 }}>Loading signal...</p></div>
+            <div className="empty-state"><div className="spinner" /><p style={{ color: '#94A3B8', marginTop: 16 }}>Loading signal...</p></div>
           ) : (
             <div className="detail">
+              {/* Header */}
               <div className="detail-header">
-                <div>
-                  <h2 style={{ margin: 0, color: '#E6EDF3', display: 'flex', alignItems: 'baseline', gap: 12 }}>
-                    {selected}
-                    {livePrices[selected] != null && <span style={{ fontSize: 18, color: '#58A6FF', fontWeight: 400 }}>{fmt(livePrices[selected])}</span>}
-                  </h2>
-                  <span style={{ color: '#8B949E', fontSize: 14 }}>{watchlist.find(w => w.symbol === selected)?.name}</span>
+                <div className="detail-title-block">
+                  <div className="detail-title-row">
+                    <span className="detail-symbol">{selected}</span>
+                    {livePrices[selected] != null && <span className="detail-price">{fmt(livePrices[selected])}</span>}
+                    {signal?.is_hot_confluence && <span className="badge-hot confluence">HOT CONFLUENCE</span>}
+                    {signal?.is_hot && !signal.is_hot_confluence && <span className="badge-hot">HOT</span>}
+                  </div>
+                  <div className="detail-name">{watchlist.find(w => w.symbol === selected)?.name}</div>
                 </div>
-                <div className="tf-row">
-                  {TFS.map(t => <button key={t} className={`tf ${tf === t ? 'active' : ''}`} onClick={() => setTf(t)}>{t}</button>)}
+                <div className="detail-controls">
+                  <div className="tf-row">
+                    {TFS.map(t => <button key={t} className={`tf ${tf === t ? 'active' : ''}`} onClick={() => setTf(t)}>{t}</button>)}
+                    <button
+                      className={`tf refresh-btn ${refreshing ? 'spinning' : ''}`}
+                      title="Refresh signal & chart"
+                      onClick={() => selected && loadSignalData(selected, tf, true)}
+                      disabled={refreshing}
+                    >↻</button>
+                  </div>
+                  {signalAge && (
+                    <div className="last-updated">Updated {timeAgo(Math.floor(signalAge / 1000))}</div>
+                  )}
+                  <div className="strategy-select-wrap">
+                    <select className="strategy-select" value={activeStrategy ?? ''} onChange={e => setActiveStrategy(e.target.value ? e.target.value as StrategyKey : null)}>
+                      <option value="">AI Signal</option>
+                      {(['Price Action', 'Trend', 'Momentum', 'Volatility', 'Institutional'] as const).map(cat => {
+                        const items = STRATEGIES.filter(s => s.category === cat)
+                        return items.length ? (
+                          <optgroup key={cat} label={cat}>
+                            {items.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                          </optgroup>
+                        ) : null
+                      })}
+                    </select>
+                    <span className="strategy-select-arrow">▾</span>
+                  </div>
                 </div>
               </div>
 
               {/* Chart */}
               <div className="chart-box">
                 {candles.length === 0
-                  ? <div style={{ height: 300, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#484F58' }}>No chart data</div>
+                  ? <div className="chart-empty">No chart data available</div>
                   : <div ref={chartRef} style={{ width: '100%' }} />
                 }
-                {signalHistory.length > 0 && (
-                  <div className="chart-legend">
-                    <span className="legend-item"><span className="legend-dot" style={{ background: '#00C896' }} /> BUY signal</span>
-                    <span className="legend-item"><span className="legend-dot" style={{ background: '#FF4560' }} /> SELL signal</span>
-                  </div>
-                )}
+                <div className="chart-legend">
+                  <span className="legend-item"><span className="legend-dot" style={{ background: '#10B981' }} />Buy</span>
+                  <span className="legend-item"><span className="legend-dot" style={{ background: '#EF4444' }} />Sell</span>
+                  <span className="legend-item"><span className="legend-line red" />SL</span>
+                  <span className="legend-item"><span className="legend-line green" />TP1</span>
+                </div>
               </div>
 
-              {/* Signal card */}
-              {signal && (
+              {/* Unified signal panel */}
+              {strategyLoading ? (
                 <div className="signal-card">
-                  <div className="signal-top">
-                    <span className="rec-badge" style={{ color: REC_COLOR[signal.recommendation], border: `1px solid ${REC_COLOR[signal.recommendation]}60`, background: REC_COLOR[signal.recommendation] + '18' }}>
-                      {signal.recommendation}
+                  <div className="loading-row">
+                    <div className="spinner" style={{ width: 18, height: 18, borderWidth: 2 }} />
+                    <span>Analysing with {currentStrategyInfo?.label}…</span>
+                  </div>
+                </div>
+              ) : displayData ? (
+                <div className={`signal-card rec-${displayData.recommendation.toLowerCase()}`}>
+                  {/* Source tag */}
+                  <div className="signal-source-row">
+                    <span className="signal-source-tag">
+                      {currentStrategyInfo ? currentStrategyInfo.label : 'AI Signal'}
                     </span>
-                    {signal.is_hot_confluence && <span className="badge-hot" style={{ background: '#FF456018', color: '#FF4560' }}>🔥 HOT-CONFLUENCE</span>}
-                    {signal.is_hot && !signal.is_hot_confluence && <span className="badge-hot" style={{ background: '#F7931A18', color: '#F7931A' }}>⚡ HOT</span>}
-                    <span style={{ marginLeft: 'auto', color: '#8B949E', fontSize: 13 }}>{signal.timeframe}</span>
+                    {currentStrategyInfo && <span className="signal-source-desc">{currentStrategyInfo.desc}</span>}
+                    <span className="signal-tf-tag">{tf}</span>
                   </div>
 
-                  <div className="conf-row">
-                    <span style={{ color: '#8B949E', fontSize: 13, width: 90 }}>Confidence</span>
-                    <div className="conf-bg"><div className="conf-fill" style={{ width: `${Math.round(signal.confidence * 100)}%`, background: REC_COLOR[signal.recommendation] }} /></div>
-                    <span style={{ color: REC_COLOR[signal.recommendation], fontWeight: 700, fontSize: 14, width: 42, textAlign: 'right' }}>{Math.round(signal.confidence * 100)}%</span>
-                  </div>
-
-                  <div className="targets">
-                    {([
-                      ['Entry zone', `${signal.entry_zone.low.toFixed(4)} – ${signal.entry_zone.high.toFixed(4)}`, ''],
-                      ['Target', signal.target_price.toFixed(4), '#00C896'],
-                      ['Stop loss', signal.stop_loss.toFixed(4), '#FF4560'],
-                    ] as [string, string, string][]).map(([label, val, col]) => (
-                      <div key={label} className="target-item">
-                        <div style={{ color: '#8B949E', fontSize: 12, marginBottom: 2 }}>{label}</div>
-                        <div style={{ color: col || '#E6EDF3', fontWeight: 600, fontSize: 13 }}>{val}</div>
+                  {/* Rec + confidence */}
+                  <div className="signal-top">
+                    <span className="rec-badge" style={{ color: REC_COLOR[displayData.recommendation], borderColor: REC_COLOR[displayData.recommendation] + '50', background: REC_COLOR[displayData.recommendation] + '15' }}>
+                      {displayData.recommendation}
+                    </span>
+                    <div className="conf-row">
+                      <div className="conf-bg">
+                        <div className="conf-fill" style={{ width: `${Math.round(displayData.confidence * 100)}%`, background: REC_COLOR[displayData.recommendation] }} />
                       </div>
-                    ))}
+                      <span className="conf-pct" style={{ color: REC_COLOR[displayData.recommendation] }}>{Math.round(displayData.confidence * 100)}%</span>
+                    </div>
                   </div>
 
-                  {signal.indicators && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 16 }}>
-                      {([['RSI', signal.indicators.rsi?.toFixed(1)], ['ADX', signal.indicators.adx?.toFixed(1)], ['Vol Z', signal.indicators.vol_zscore?.toFixed(2)], ['%B', signal.indicators.bb_pct_b?.toFixed(2)]] as [string, string][]).map(([l, v]) => (
-                        <div key={l} style={{ background: '#21262D', borderRadius: 6, padding: '4px 10px', display: 'flex', gap: 6, alignItems: 'center' }}>
-                          <span style={{ color: '#8B949E', fontSize: 11 }}>{l}</span>
-                          <span style={{ color: '#E6EDF3', fontSize: 11, fontWeight: 600 }}>{v}</span>
-                        </div>
-                      ))}
+                  {/* Targets grid */}
+                  <div className="targets-grid">
+                    <div className="target-cell">
+                      <div className="target-label">Entry zone</div>
+                      <div className="target-value">{displayData.entry_zone.low.toFixed(4)} – {displayData.entry_zone.high.toFixed(4)}</div>
+                    </div>
+                    <div className="target-cell">
+                      <div className="target-label">Stop loss</div>
+                      <div className="target-value sell">{fmt(displayData.stop_loss)}</div>
+                    </div>
+                  </div>
+
+                  {/* TP ladder */}
+                  {displayData.recommendation !== 'HOLD' && (
+                    <div className="tp-ladder">
+                      {([
+                        ['TP1', displayData.tp1, '1.5 R'],
+                        ['TP2', displayData.tp2 ?? displayData.target_price, '3.0 R'],
+                        ['TP3', displayData.tp3, '4.5 R'],
+                      ] as [string, number | undefined, string][]).map(([lbl, price, rr]) =>
+                        price != null ? (
+                          <div key={lbl} className="tp-row">
+                            <span className="tp-rr">{rr}</span>
+                            <span className="tp-lbl">{lbl}</span>
+                            <span className="tp-price">{fmt(price)}</span>
+                          </div>
+                        ) : null
+                      )}
                     </div>
                   )}
 
-                  <button className="btn-log-trade"
-                    style={{ borderColor: REC_COLOR[signal.recommendation] + '60', color: REC_COLOR[signal.recommendation], background: REC_COLOR[signal.recommendation] + '18' }}
-                    onClick={() => {
-                      setNewTrade(p => ({ ...p, symbol: signal.symbol, direction: signal.recommendation === 'SELL' ? 'SELL' : 'BUY', entry_price: signal.entry_zone.low.toFixed(6) }))
-                      setMainView('journal'); setJournalSub('new')
-                    }}>
-                    Log this trade in Journal
-                  </button>
-                </div>
-              )}
+                  {/* Indicators + Gate meter (general signal only) */}
+                  {!activeStrategy && signal?.indicators && (
+                    <>
+                      <div className="ind-strip">
+                        {([['RSI', signal.indicators.rsi?.toFixed(1)], ['ADX', signal.indicators.adx?.toFixed(1)], ['Vol Z', signal.indicators.vol_zscore?.toFixed(2)], ['%B', signal.indicators.bb_pct_b?.toFixed(2)]] as [string, string][]).map(([l, v]) => (
+                          <div key={l} className="ind-chip"><span className="ind-label">{l}</span><span className="ind-val">{v}</span></div>
+                        ))}
+                      </div>
+                      {signal.indicators.bull_gates != null && (
+                        <div className="gate-meter">
+                          <span className="gate-label">Confluence gates</span>
+                          <div className="gate-dots">
+                            {Array.from({ length: 7 }, (_, i) => {
+                              const bg = signal.recommendation === 'BUY'
+                                ? i < (signal.indicators!.bull_gates ?? 0) ? 'var(--green)' : 'var(--surface3)'
+                                : signal.recommendation === 'SELL'
+                                ? i < (signal.indicators!.bear_gates ?? 0) ? 'var(--red)' : 'var(--surface3)'
+                                : 'var(--surface3)'
+                              return <span key={i} className="gate-dot" style={{ background: bg }} />
+                            })}
+                          </div>
+                          <span className="gate-count" style={{ color: signal.recommendation === 'BUY' ? 'var(--green)' : signal.recommendation === 'SELL' ? 'var(--red)' : 'var(--text3)' }}>
+                            {signal.recommendation === 'BUY' ? signal.indicators.bull_gates : signal.recommendation === 'SELL' ? signal.indicators.bear_gates : 0}/7
+                          </span>
+                        </div>
+                      )}
+                    </>
+                  )}
 
-              {/* ===== AI ANALYSIS + NEWS ===== */}
-              {signal && (
-                <div className="analysis-section">
-                  <h3 className="analysis-title">AI Analysis</h3>
-
-                  {/* Narrative paragraphs */}
-                  <div className="narrative">
-                    {buildNarrative(signal, selected).map((p, i) => (
-                      <p key={i} className="narrative-para">{p}</p>
+                  {/* Reasoning */}
+                  <div className="reasons">
+                    {displayData.reasoning.map((r, i) => (
+                      <div key={i} className="reason-row"><span className="reason-arrow">›</span><span className="reason-text">{r}</span></div>
                     ))}
                   </div>
 
-                  {/* Signal history timeline */}
+                  {/* Strategy extras */}
+                  {activeStrategy === 'fibonacci' && strategyResult?.fib_levels && (
+                    <div className="strat-extra">
+                      <div className="section-label">Fibonacci Levels</div>
+                      <div className="fib-levels">
+                        {Object.entries(strategyResult.fib_levels).map(([label, price]) => {
+                          const short = label.replace('.0%', '%')
+                          const isClosest = label === strategyResult.closest_level
+                          return (
+                            <div key={label} className={`fib-row${isClosest ? ' active' : ''}`}>
+                              <span className="fib-dot" style={{ background: FIB_COLORS[short] ?? '#8B949E' }} />
+                              <span className="fib-pct">{short}</span>
+                              <span className="fib-price">{fmt(price)}</span>
+                              {isClosest && <span className="fib-current">current</span>}
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {activeStrategy === 'smart_money' && strategyResult && (
+                    <div className="strat-extra">
+                      <div className="smc-struct-row">
+                        <span className="section-label">Structure</span>
+                        <span className={`smc-struct ${strategyResult.structure?.startsWith('Bull') ? 'bull' : strategyResult.structure?.startsWith('Bear') ? 'bear' : ''}`}>{strategyResult.structure}</span>
+                      </div>
+                      {strategyResult.zones && strategyResult.zones.length > 0 && (
+                        <div className="smc-zones">
+                          {strategyResult.zones.map((z, i) => (
+                            <div key={i} className="smc-zone">
+                              <span className={`smc-zone-tag ${z.type.includes('bull') ? 'bull' : 'bear'}`}>{z.label}</span>
+                              <span className="smc-zone-range">{fmt(z.low)} – {fmt(z.high)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {activeStrategy === 'elliott_wave' && strategyResult && (
+                    <div className="strat-extra">
+                      <div className="smc-struct-row">
+                        <span className="section-label">Wave position</span>
+                        <span className="ew-label">{strategyResult.wave_label}</span>
+                      </div>
+                      {strategyResult.pivots && (
+                        <div className="ew-pivots">
+                          {strategyResult.pivots.map((p, i) => (
+                            <div key={i} className={`ew-pivot ${p.type === 'H' ? 'high' : 'low'}`}>
+                              <div className="ew-pivot-type">{p.type === 'H' ? 'HIGH' : 'LOW'}</div>
+                              <div className="ew-pivot-price">{fmt(p.price)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {activeStrategy === 'warren_buffett' && strategyResult?.scores && (
+                    <div className="strat-extra">
+                      <div className="section-label">Scorecard</div>
+                      <div className="buffett-scores">
+                        {([['Quality', strategyResult.scores.quality, 4], ['Value', strategyResult.scores.value, 5], ['Total', strategyResult.scores.total, 9]] as [string, number, number][]).map(([l, v, max]) => (
+                          <div key={l} className="buffett-item">
+                            <div className="buffett-label">{l}</div>
+                            <div className={`buffett-val ${v >= max * 0.6 ? 'good' : v >= max * 0.3 ? 'mid' : 'bad'}`}>{v}/{max}</div>
+                          </div>
+                        ))}
+                      </div>
+                      {strategyResult.key_levels && (
+                        <div className="key-levels">
+                          {Object.entries(strategyResult.key_levels).map(([k, v]) => (
+                            <div key={k} className="key-level"><span className="key-level-label">{k.replace(/_/g, ' ')}</span><span className="key-level-val">{fmt(v)}</span></div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {activeStrategy === 'jpmorgan' && strategyResult?.factors && (
+                    <div className="strat-extra">
+                      <div className="section-label">Quantitative Factors</div>
+                      <div className="jpm-factors">
+                        {Object.entries(strategyResult.factors).map(([k, v]) => (
+                          <div key={k} className="jpm-factor">
+                            <div className="jpm-factor-label">{k.replace(/_/g, ' ')}</div>
+                            <div className={`jpm-factor-val ${v > 0 ? 'pos' : v < 0 ? 'neg' : ''}`}>{v > 0 ? '+' : ''}{typeof v === 'number' ? v.toFixed(3) : v}</div>
+                          </div>
+                        ))}
+                      </div>
+                      {strategyResult.composite_score != null && (
+                        <div className="jpm-composite">Composite: <span className={(strategyResult.composite_score) > 0 ? 'pos' : 'neg'}>{strategyResult.composite_score > 0 ? '+' : ''}{strategyResult.composite_score.toFixed(3)}</span></div>
+                      )}
+                    </div>
+                  )}
+
+                  <button className="btn-log-trade" onClick={() => {
+                    setNewTrade(p => ({ ...p, symbol: selected, direction: displayData.recommendation === 'SELL' ? 'SELL' : 'BUY', entry_price: displayData.entry_zone.low.toFixed(6) }))
+                    setMainView('journal'); setJournalSub('new')
+                  }}>Log in Journal</button>
+                </div>
+              ) : null}
+
+              {/* AI analysis + news — only in AI mode */}
+              {!activeStrategy && signal && (
+                <div className="analysis-section">
+                  <h3 className="analysis-title">AI Analysis</h3>
+                  <div className="narrative">
+                    {buildNarrative(signal, selected).map((p, i) => <p key={i} className="narrative-para">{p}</p>)}
+                  </div>
                   {signalHistory.length > 0 && (
                     <div style={{ marginTop: 20 }}>
                       <div className="section-label">Signal History ({signal.timeframe})</div>
                       <div className="history-row">
                         {[...signalHistory].reverse().map((h, i) => (
-                          <div key={i} className="history-pill" style={{
-                            background: REC_COLOR[h.recommendation] + '18',
-                            borderColor: REC_COLOR[h.recommendation] + '50',
-                            color: REC_COLOR[h.recommendation],
-                          }}>
+                          <div key={i} className="history-pill" style={{ background: REC_COLOR[h.recommendation] + '15', borderColor: REC_COLOR[h.recommendation] + '40', color: REC_COLOR[h.recommendation] }}>
                             <span style={{ fontWeight: 700 }}>{h.recommendation}</span>
                             <span style={{ opacity: 0.7, fontSize: 11 }}>{Math.round(h.confidence * 100)}%</span>
                             <span style={{ opacity: 0.5, fontSize: 10 }}>{timeAgo(Math.floor(new Date(h.created_at).getTime() / 1000))}</span>
@@ -516,8 +849,6 @@ export default function App() {
                       </div>
                     </div>
                   )}
-
-                  {/* News */}
                   {news.length > 0 && (
                     <div style={{ marginTop: 20 }}>
                       <div className="section-label">Market News</div>
@@ -534,41 +865,324 @@ export default function App() {
                       </div>
                     </div>
                   )}
-
-                  <p style={{ color: '#484F58', fontSize: 11, textAlign: 'center', marginTop: 20 }}>⚠️ Not financial advice. Always do your own research before trading.</p>
+                  <p className="disclaimer">Not financial advice. Always do your own research before trading.</p>
                 </div>
               )}
             </div>
           )
         )}
 
-        {/* ===== JOURNAL ===== */}
+        {/* ── Strategy Lab ─────────────────────────────────── */}
+        {mainView === 'lab' && (
+          <div className="detail">
+            <div className="detail-header">
+              <div className="detail-title-block">
+                <div className="detail-symbol">Strategy Lab</div>
+                <div className="detail-name">Build and test your own trading strategy</div>
+              </div>
+              <div className="detail-controls">
+                <div className="tf-row">
+                  {TFS.map(t => <button key={t} className={`tf ${tf === t ? 'active' : ''}`} onClick={() => setTf(t)}>{t}</button>)}
+                </div>
+              </div>
+            </div>
+
+            {/* AI Strategy Description */}
+            <div className="lab-describe">
+              <div className="lab-describe-header">
+                <div className="lab-describe-icon">AI</div>
+                <div>
+                  <div className="lab-describe-title">Describe your strategy</div>
+                  <div className="lab-describe-sub">Write how you trade in plain English — AI will configure the optimal parameters for you</div>
+                </div>
+              </div>
+              <textarea
+                className="lab-describe-input"
+                placeholder={'Examples:\n• "I use swing trading with EMA crossovers, buying when momentum is strong but not overbought"\n• "Conservative trend-following strategy that requires multiple confirmations before entering"\n• "Momentum scalping on short timeframes with tight stops and high frequency"'}
+                value={labDescription}
+                onChange={e => setLabDescription(e.target.value)}
+                rows={4}
+              />
+              <div className="lab-describe-footer">
+                <button
+                  className="btn-analyze"
+                  disabled={!labDescription.trim() || labAnalysisLoading}
+                  onClick={analyzeLabStrategy}
+                >
+                  {labAnalysisLoading ? (
+                    <><span className="spinner" style={{ width: 14, height: 14, borderWidth: 2, marginRight: 8 }} />Analyzing…</>
+                  ) : 'Analyze with AI'}
+                </button>
+                {labAnalysis && (
+                  <span className="lab-describe-applied">Parameters applied to sliders below</span>
+                )}
+              </div>
+              {labAnalysis && (
+                <div className="lab-analysis-result">
+                  <div className="lab-analysis-section">
+                    <div className="lab-analysis-label">Strategy interpretation</div>
+                    <div className="lab-analysis-text">{labAnalysis.explanation}</div>
+                  </div>
+                  {labAnalysis.rationale && (
+                    <div className="lab-analysis-section">
+                      <div className="lab-analysis-label">Why these parameters</div>
+                      <div className="lab-analysis-text">{labAnalysis.rationale}</div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="lab-layout">
+              {/* Parameters panel */}
+              <div className="lab-params">
+                <div className="lab-section-title">Parameters</div>
+
+                <div className="lab-group">
+                  <div className="lab-group-title">Moving Averages</div>
+                  <div className="lab-row">
+                    <label>Fast EMA</label>
+                    <div className="lab-input-row">
+                      <input type="range" min={3} max={50} value={labParams.fast_ema} onChange={e => setLabParams(p => ({ ...p, fast_ema: +e.target.value }))} className="lab-slider" />
+                      <span className="lab-val">{labParams.fast_ema}</span>
+                    </div>
+                  </div>
+                  <div className="lab-row">
+                    <label>Slow EMA</label>
+                    <div className="lab-input-row">
+                      <input type="range" min={10} max={200} value={labParams.slow_ema} onChange={e => setLabParams(p => ({ ...p, slow_ema: +e.target.value }))} className="lab-slider" />
+                      <span className="lab-val">{labParams.slow_ema}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="lab-group">
+                  <div className="lab-group-title">RSI</div>
+                  <div className="lab-row">
+                    <label>Period</label>
+                    <div className="lab-input-row">
+                      <input type="range" min={5} max={30} value={labParams.rsi_period} onChange={e => setLabParams(p => ({ ...p, rsi_period: +e.target.value }))} className="lab-slider" />
+                      <span className="lab-val">{labParams.rsi_period}</span>
+                    </div>
+                  </div>
+                  <div className="lab-row">
+                    <label>Oversold</label>
+                    <div className="lab-input-row">
+                      <input type="range" min={10} max={45} value={labParams.rsi_oversold} onChange={e => setLabParams(p => ({ ...p, rsi_oversold: +e.target.value }))} className="lab-slider" />
+                      <span className="lab-val">{labParams.rsi_oversold}</span>
+                    </div>
+                  </div>
+                  <div className="lab-row">
+                    <label>Overbought</label>
+                    <div className="lab-input-row">
+                      <input type="range" min={55} max={90} value={labParams.rsi_overbought} onChange={e => setLabParams(p => ({ ...p, rsi_overbought: +e.target.value }))} className="lab-slider" />
+                      <span className="lab-val">{labParams.rsi_overbought}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="lab-group">
+                  <div className="lab-group-title">Risk</div>
+                  <div className="lab-row">
+                    <label>ATR Stop Mult.</label>
+                    <div className="lab-input-row">
+                      <input type="range" min={0.5} max={4} step={0.25} value={labParams.atr_multiplier} onChange={e => setLabParams(p => ({ ...p, atr_multiplier: +e.target.value }))} className="lab-slider" />
+                      <span className="lab-val">{labParams.atr_multiplier}×</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="lab-group">
+                  <div className="lab-group-title">Filters</div>
+                  <div className="lab-toggle-row">
+                    <label>Require MACD confirmation</label>
+                    <button className={`lab-toggle ${labParams.require_macd ? 'on' : ''}`} onClick={() => setLabParams(p => ({ ...p, require_macd: !p.require_macd }))}>
+                      {labParams.require_macd ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  <div className="lab-toggle-row">
+                    <label>Require volume spike</label>
+                    <button className={`lab-toggle ${labParams.require_volume ? 'on' : ''}`} onClick={() => setLabParams(p => ({ ...p, require_volume: !p.require_volume }))}>
+                      {labParams.require_volume ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                </div>
+
+                <button
+                  className="btn-primary"
+                  style={{ marginTop: 8 }}
+                  disabled={!selected || labLoading}
+                  onClick={runLab}
+                >
+                  {labLoading ? 'Analysing…' : selected ? `Run on ${selected}` : 'Select an instrument first'}
+                </button>
+                {!selected && <div style={{ color: 'var(--text3)', fontSize: 12, marginTop: 8, textAlign: 'center' }}>Select an asset from your watchlist to run the strategy</div>}
+              </div>
+
+              {/* Result panel */}
+              <div className="lab-result">
+                {labLoading ? (
+                  <div className="lab-empty"><div className="spinner" /><span>Running strategy…</span></div>
+                ) : labResult ? (
+                  <>
+                    <div className="lab-section-title">Result — {selected} · {tf}</div>
+                    <div className={`signal-card rec-${labResult.recommendation.toLowerCase()}`} style={{ marginTop: 10 }}>
+                      <div className="signal-source-row">
+                        <span className="signal-source-tag">Custom Strategy</span>
+                        <span className="signal-source-desc">EMA {labParams.fast_ema}/{labParams.slow_ema} · RSI {labParams.rsi_period}{labParams.require_macd ? ' · MACD' : ''}{labParams.require_volume ? ' · Vol' : ''}</span>
+                        <span className="signal-tf-tag">{tf}</span>
+                      </div>
+                      <div className="signal-top">
+                        <span className="rec-badge" style={{ color: REC_COLOR[labResult.recommendation], borderColor: REC_COLOR[labResult.recommendation] + '50', background: REC_COLOR[labResult.recommendation] + '15' }}>
+                          {labResult.recommendation}
+                        </span>
+                        <div className="conf-row">
+                          <div className="conf-bg"><div className="conf-fill" style={{ width: `${Math.round(labResult.confidence * 100)}%`, background: REC_COLOR[labResult.recommendation] }} /></div>
+                          <span className="conf-pct" style={{ color: REC_COLOR[labResult.recommendation] }}>{Math.round(labResult.confidence * 100)}%</span>
+                        </div>
+                      </div>
+                      <div className="targets-grid">
+                        <div className="target-cell"><div className="target-label">Entry zone</div><div className="target-value">{labResult.entry_zone.low.toFixed(4)} – {labResult.entry_zone.high.toFixed(4)}</div></div>
+                        <div className="target-cell"><div className="target-label">Stop loss</div><div className="target-value sell">{fmt(labResult.stop_loss)}</div></div>
+                      </div>
+                      {labResult.recommendation !== 'HOLD' && (
+                        <div className="tp-ladder">
+                          {([['TP1', labResult.tp1, '1.5 R'], ['TP2', labResult.tp2 ?? labResult.target_price, '3.0 R'], ['TP3', labResult.tp3, '4.5 R']] as [string, number | undefined, string][]).map(([lbl, price, rr]) =>
+                            price != null ? (
+                              <div key={lbl} className="tp-row">
+                                <span className="tp-rr">{rr}</span>
+                                <span className="tp-lbl">{lbl}</span>
+                                <span className="tp-price">{fmt(price)}</span>
+                              </div>
+                            ) : null
+                          )}
+                        </div>
+                      )}
+                      <div className="reasons">
+                        {labResult.reasoning.map((r, i) => (
+                          <div key={i} className="reason-row"><span className="reason-arrow">›</span><span className="reason-text">{r}</span></div>
+                        ))}
+                      </div>
+                      <button className="btn-log-trade" onClick={() => {
+                        setNewTrade(p => ({ ...p, symbol: selected!, direction: labResult!.recommendation === 'SELL' ? 'SELL' : 'BUY', entry_price: labResult!.entry_zone.low.toFixed(6) }))
+                        setMainView('journal'); setJournalSub('new')
+                      }}>Log in Journal</button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="lab-empty">
+                    <div className="lab-empty-icon" />
+                    <span>Configure parameters and click Run</span>
+                    <span style={{ color: 'var(--text3)', fontSize: 11, marginTop: 4 }}>Results will appear here</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── AI Chat ──────────────────────────────────────── */}
+        {mainView === 'chat' && (
+          <div className="chat-view">
+            <div className="chat-header">
+              <div>
+                <div className="chat-title">AI Trading Assistant</div>
+                <div className="chat-sub">{selected ? `Context: ${selected} · ${tf}` : 'Select an instrument for context-aware analysis'}</div>
+              </div>
+              {chatMessages.length > 0 && (
+                <button className="btn-link" style={{ fontSize: 12 }} onClick={() => setChatMessages([])}>Clear chat</button>
+              )}
+            </div>
+
+            <div className="chat-messages">
+              {chatMessages.length === 0 && (
+                <div className="chat-welcome">
+                  <div className="chat-welcome-icon">TS</div>
+                  <div className="chat-welcome-title">Ask me anything about the markets</div>
+                  <div className="chat-welcome-sub">I can analyse technical setups, explain indicators, discuss risk management, and more.{selected ? ` Currently viewing ${selected}.` : ''}</div>
+                </div>
+              )}
+              {chatMessages.map((m, i) => (
+                <div key={i} className={`chat-bubble-wrap ${m.role}`}>
+                  {m.role === 'ai' && <div className="chat-avatar">TS</div>}
+                  <div className={`chat-bubble ${m.role}`}>
+                    {m.text.split('\n').map((line, j) => (
+                      <span key={j}>
+                        {line.split(/(\*\*[^*]+\*\*)/).map((part, k) =>
+                          part.startsWith('**') && part.endsWith('**')
+                            ? <strong key={k}>{part.slice(2, -2)}</strong>
+                            : part
+                        )}
+                        {j < m.text.split('\n').length - 1 && <br />}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              {chatLoading && (
+                <div className="chat-bubble-wrap ai">
+                  <div className="chat-avatar">TS</div>
+                  <div className="chat-bubble ai chat-typing">
+                    <span /><span /><span />
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} />
+            </div>
+
+            <div className="chat-input-area">
+              <div className="chat-chips">
+                {[
+                  selected ? `Should I buy ${selected}?` : 'Should I buy?',
+                  'Explain the signal',
+                  'What are the key levels?',
+                  'How should I manage risk?',
+                  'What does the volume say?',
+                  'Latest news impact',
+                ].map(chip => (
+                  <button key={chip} className="chat-chip" onClick={() => sendChat(chip)}>{chip}</button>
+                ))}
+              </div>
+              <div className="chat-input-row">
+                <input
+                  className="input chat-input"
+                  placeholder="Ask about technicals, strategy, risk management…"
+                  value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && !e.shiftKey && sendChat()}
+                  disabled={chatLoading}
+                />
+                <button className="chat-send" onClick={() => sendChat()} disabled={!chatInput.trim() || chatLoading}>
+                  {chatLoading ? '…' : '↑'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {mainView === 'journal' && (
           <div className="detail">
             <div className="detail-header">
-              <h2 style={{ margin: 0, color: '#E6EDF3' }}>Trade Journal</h2>
+              <span className="detail-symbol">Trade Journal</span>
             </div>
-
             {tradeStats && tradeStats.total > 0 && (
               <div className="stats-row">
                 {([['Total', String(tradeStats.total)], ['Win Rate', `${tradeStats.win_rate}%`], ['Total P&L', fmt(tradeStats.total_pnl)], ['Avg P&L', fmt(tradeStats.avg_pnl)], ['Wins', String(tradeStats.wins)], ['Losses', String(tradeStats.losses)]] as [string, string][]).map(([l, v]) => (
                   <div key={l} className="stat-card">
-                    <div style={{ color: '#8B949E', fontSize: 11, marginBottom: 4 }}>{l}</div>
-                    <div style={{ color: (l === 'Total P&L' || l === 'Avg P&L') ? (v.startsWith('-') ? '#FF4560' : '#00C896') : l === 'Win Rate' ? '#00C896' : '#E6EDF3', fontWeight: 700, fontSize: 16 }}>{v}</div>
+                    <div style={{ color: '#94A3B8', fontSize: 11, marginBottom: 4 }}>{l}</div>
+                    <div style={{ color: (l === 'Total P&L' || l === 'Avg P&L') ? (v.startsWith('-') ? '#EF4444' : '#10B981') : l === 'Win Rate' ? '#10B981' : '#E2E8F0', fontWeight: 700, fontSize: 16 }}>{v}</div>
                   </div>
                 ))}
               </div>
             )}
-
             <div className="tab-row" style={{ marginBottom: 16 }}>
               <button className={`tab ${journalSub === 'open' ? 'active' : ''}`} onClick={() => setJournalSub('open')}>Open ({openTrades.length})</button>
               <button className={`tab ${journalSub === 'closed' ? 'active' : ''}`} onClick={() => setJournalSub('closed')}>Closed ({closedTrades.length})</button>
               <button className={`tab ${journalSub === 'new' ? 'active' : ''}`} onClick={() => setJournalSub('new')}>+ New Trade</button>
             </div>
-
             {journalSub === 'new' && (
               <div className="trade-form">
-                <h3 style={{ color: '#E6EDF3', fontSize: 16, marginBottom: 16 }}>Log New Trade</h3>
+                <h3 style={{ color: '#E2E8F0', fontSize: 16, marginBottom: 16 }}>Log New Trade</h3>
                 <div className="form-row">
                   <div className="form-field"><label>Symbol</label><input className="input" placeholder="BTCUSD" value={newTrade.symbol} onChange={e => setNewTrade(p => ({ ...p, symbol: e.target.value.toUpperCase() }))} /></div>
                   <div className="form-field"><label>Direction</label><select className="input" value={newTrade.direction} onChange={e => setNewTrade(p => ({ ...p, direction: e.target.value }))}><option value="BUY">BUY (Long)</option><option value="SELL">SELL (Short)</option></select></div>
@@ -577,22 +1191,21 @@ export default function App() {
                   <div className="form-field"><label>Entry Price</label><input className="input" placeholder="0.00" type="number" step="any" value={newTrade.entry_price} onChange={e => setNewTrade(p => ({ ...p, entry_price: e.target.value }))} /></div>
                   <div className="form-field"><label>Size</label><input className="input" placeholder="1.0" type="number" step="any" value={newTrade.size} onChange={e => setNewTrade(p => ({ ...p, size: e.target.value }))} /></div>
                 </div>
-                <div className="form-field"><label>Notes (optional)</label><input className="input" placeholder="Signal reason, strategy..." value={newTrade.notes} onChange={e => setNewTrade(p => ({ ...p, notes: e.target.value }))} /></div>
+                <div className="form-field"><label>Notes (optional)</label><input className="input" placeholder="Signal reason, strategy…" value={newTrade.notes} onChange={e => setNewTrade(p => ({ ...p, notes: e.target.value }))} /></div>
                 <button className="btn-primary" style={{ marginTop: 12 }} disabled={!newTrade.symbol || !newTrade.entry_price} onClick={createTrade}>Log Trade</button>
               </div>
             )}
-
             {journalSub === 'open' && (
               openTrades.length === 0
                 ? <div className="empty-hint" style={{ padding: '40px 0' }}>No open trades. Use "+ New Trade" to log one.</div>
                 : openTrades.map(t => (
                   <div key={t.id} className="trade-row">
                     <div className="trade-row-left">
-                      <span className="dir-badge" style={{ color: t.direction === 'BUY' ? '#00C896' : '#FF4560', borderColor: t.direction === 'BUY' ? '#00C89660' : '#FF456060', background: (t.direction === 'BUY' ? '#00C896' : '#FF4560') + '18' }}>{t.direction}</span>
+                      <span className="dir-badge" style={{ color: t.direction === 'BUY' ? '#10B981' : '#EF4444', borderColor: (t.direction === 'BUY' ? '#10B981' : '#EF4444') + '50', background: (t.direction === 'BUY' ? '#10B981' : '#EF4444') + '15' }}>{t.direction}</span>
                       <div>
-                        <div style={{ color: '#E6EDF3', fontWeight: 700, fontSize: 14 }}>{t.symbol}</div>
-                        <div style={{ color: '#8B949E', fontSize: 12 }}>Entry: {fmt(t.entry_price)} · Size: {t.size} · {new Date(t.opened_at).toLocaleDateString()}</div>
-                        {t.notes && <div style={{ color: '#6E7681', fontSize: 11, marginTop: 2 }}>{t.notes}</div>}
+                        <div style={{ color: '#E2E8F0', fontWeight: 700, fontSize: 14 }}>{t.symbol}</div>
+                        <div style={{ color: '#94A3B8', fontSize: 12 }}>Entry: {fmt(t.entry_price)} · Size: {t.size} · {new Date(t.opened_at).toLocaleDateString()}</div>
+                        {t.notes && <div style={{ color: '#4A5568', fontSize: 11, marginTop: 2 }}>{t.notes}</div>}
                       </div>
                     </div>
                     <div className="trade-row-right">
@@ -612,24 +1225,23 @@ export default function App() {
                   </div>
                 ))
             )}
-
             {journalSub === 'closed' && (
               closedTrades.length === 0
                 ? <div className="empty-hint" style={{ padding: '40px 0' }}>No closed trades yet.</div>
                 : closedTrades.map(t => (
                   <div key={t.id} className="trade-row">
                     <div className="trade-row-left">
-                      <span className="dir-badge" style={{ color: t.direction === 'BUY' ? '#00C896' : '#FF4560', borderColor: t.direction === 'BUY' ? '#00C89660' : '#FF456060', background: (t.direction === 'BUY' ? '#00C896' : '#FF4560') + '18' }}>{t.direction}</span>
+                      <span className="dir-badge" style={{ color: t.direction === 'BUY' ? '#10B981' : '#EF4444', borderColor: (t.direction === 'BUY' ? '#10B981' : '#EF4444') + '50', background: (t.direction === 'BUY' ? '#10B981' : '#EF4444') + '15' }}>{t.direction}</span>
                       <div>
-                        <div style={{ color: '#E6EDF3', fontWeight: 700, fontSize: 14 }}>{t.symbol}</div>
-                        <div style={{ color: '#8B949E', fontSize: 12 }}>{fmt(t.entry_price)} → {fmt(t.exit_price)} · Size: {t.size}</div>
-                        <div style={{ color: '#6E7681', fontSize: 11, marginTop: 2 }}>{new Date(t.opened_at).toLocaleDateString()} → {t.closed_at ? new Date(t.closed_at).toLocaleDateString() : '—'}</div>
-                        {t.notes && <div style={{ color: '#6E7681', fontSize: 11, marginTop: 2 }}>{t.notes}</div>}
+                        <div style={{ color: '#E2E8F0', fontWeight: 700, fontSize: 14 }}>{t.symbol}</div>
+                        <div style={{ color: '#94A3B8', fontSize: 12 }}>{fmt(t.entry_price)} → {fmt(t.exit_price)} · Size: {t.size}</div>
+                        <div style={{ color: '#4A5568', fontSize: 11, marginTop: 2 }}>{new Date(t.opened_at).toLocaleDateString()} → {t.closed_at ? new Date(t.closed_at).toLocaleDateString() : '—'}</div>
+                        {t.notes && <div style={{ color: '#4A5568', fontSize: 11, marginTop: 2 }}>{t.notes}</div>}
                       </div>
                     </div>
                     <div className="trade-row-right" style={{ flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
-                      <div style={{ color: (t.pnl ?? 0) >= 0 ? '#00C896' : '#FF4560', fontWeight: 700, fontSize: 16 }}>{(t.pnl ?? 0) >= 0 ? '+' : ''}{fmt(t.pnl)}</div>
-                      {t.pnl_pct != null && <div style={{ color: t.pnl_pct >= 0 ? '#00C896' : '#FF4560', fontSize: 12 }}>{t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(2)}%</div>}
+                      <div style={{ color: (t.pnl ?? 0) >= 0 ? '#10B981' : '#EF4444', fontWeight: 700, fontSize: 16 }}>{(t.pnl ?? 0) >= 0 ? '+' : ''}{fmt(t.pnl)}</div>
+                      {t.pnl_pct != null && <div style={{ color: t.pnl_pct >= 0 ? '#10B981' : '#EF4444', fontSize: 12 }}>{t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(2)}%</div>}
                       <button className="btn-remove" onClick={() => deleteTrade(t.id)}>×</button>
                     </div>
                   </div>
@@ -637,6 +1249,172 @@ export default function App() {
             )}
           </div>
         )}
+
+        {/* ── Trend RR Strategy ──────────────────────────────── */}
+        {mainView === 'trendrr' && (
+          <div className="chat-view" style={{ padding: '24px 28px', overflowY: 'auto' }}>
+
+            {/* Header */}
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 24, flexWrap: 'wrap', gap: 12 }}>
+              <div>
+                <div style={{ color: '#E2E8F0', fontWeight: 700, fontSize: 20 }}>Semi-Auto 1:2 RR Trend Strategy</div>
+                <div style={{ color: '#64748B', fontSize: 13, marginTop: 4 }}>
+                  EMA-50 trend filter · RSI-14 pullback entry · 1% risk sizing · Manual exit approval
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button className="btn-primary" style={{ fontSize: 13, padding: '8px 18px' }}
+                  disabled={trendRRScanning}
+                  onClick={triggerTrendRRScan}>
+                  {trendRRScanning ? <><span className="spinner" style={{ width: 13, height: 13, borderWidth: 2, marginRight: 8 }} />Scanning…</> : '▶ Run Scan'}
+                </button>
+                <button className="btn-link" style={{ fontSize: 13 }} onClick={loadTrendRR}>↻ Refresh</button>
+              </div>
+            </div>
+
+            {trendRRLoading && <div style={{ color: '#64748B', fontSize: 14 }}>Loading…</div>}
+
+            {trendRR && (
+              <>
+                {/* Market status bar */}
+                <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 20, padding: '10px 16px', background: '#0F172A', border: '1px solid #1E293B', borderRadius: 10, fontSize: 13 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: trendRR.market_open ? '#10B981' : '#EF4444', display: 'inline-block', boxShadow: trendRR.market_open ? '0 0 6px #10B981' : 'none' }} />
+                    <span style={{ color: trendRR.market_open ? '#10B981' : '#EF4444', fontWeight: 600 }}>{trendRR.market_open ? 'Market Open' : 'Market Closed'}</span>
+                  </div>
+                  <span style={{ color: '#475569' }}>{trendRR.current_time_et}</span>
+                  <span style={{ color: '#334155' }}>|</span>
+                  <span style={{ color: '#64748B' }}>Trades opened today: <span style={{ color: '#E2E8F0', fontWeight: 600 }}>{trendRR.trades_opened_today}</span></span>
+                  <span style={{ color: '#334155' }}>|</span>
+                  <span style={{ color: '#64748B' }}>Auto-scan: <span style={{ color: '#94A3B8' }}>every 30 min · Mon–Fri 09:35–15:30 ET</span></span>
+                </div>
+
+                {/* Config strip */}
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 24 }}>
+                  {[
+                    ['Risk', `${trendRR.config.risk_pct}%`],
+                    ['EMA', trendRR.config.ema_period],
+                    ['RSI trigger', `>${trendRR.config.rsi_trigger}`],
+                    ['ATR mult', `×${trendRR.config.atr_sl_multiplier}`],
+                    ['RR', `1:${trendRR.config.rr_ratio}`],
+                    ['TF', trendRR.config.timeframe],
+                    ['Universe', `${trendRR.config.scan_universe.length} symbols`],
+                  ].map(([label, val]) => (
+                    <div key={label as string} style={{ background: '#1E293B', border: '1px solid #2D3748', borderRadius: 8, padding: '6px 12px', fontSize: 12 }}>
+                      <span style={{ color: '#64748B' }}>{label} </span>
+                      <span style={{ color: '#E2E8F0', fontWeight: 600 }}>{val}</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* How it works banner */}
+                <div style={{ background: '#0F172A', border: '1px solid #1D4ED880', borderRadius: 10, padding: '14px 18px', marginBottom: 24, fontSize: 12, color: '#94A3B8', lineHeight: 1.7 }}>
+                  <span style={{ color: '#3B82F6', fontWeight: 600 }}>How it works: </span>
+                  Every 15 min the scanner checks {trendRR.config.scan_universe.length} symbols on the {trendRR.config.timeframe} chart. When
+                  price is above EMA-{trendRR.config.ema_period} <strong>and</strong> RSI crosses above {trendRR.config.rsi_trigger} from below, it automatically places a market
+                  order sized to risk exactly {trendRR.config.risk_pct}% of equity. Stop loss = {trendRR.config.atr_sl_multiplier}×ATR below entry,
+                  take profit = {trendRR.config.rr_ratio * trendRR.config.atr_sl_multiplier}×ATR above entry (1:{trendRR.config.rr_ratio} RR).
+                  When price reaches either level a <strong>push notification</strong> is sent — you review and manually close.
+                </div>
+
+                {/* Active trades */}
+                <div style={{ color: '#94A3B8', fontSize: 13, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 12 }}>
+                  Active Trades ({trendRR.active_trades})
+                </div>
+
+                {trendRR.trades.length === 0 ? (
+                  <div style={{ background: '#1E293B', border: '1px solid #2D3748', borderRadius: 10, padding: '32px 20px', textAlign: 'center', color: '#4A5568', fontSize: 14 }}>
+                    No active trades — run a scan or wait for the next automatic cycle
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                    {trendRR.trades.map(t => {
+                      const pl = t.unrealized_pnl
+                      const plPct = t.unrealized_pnl_pct
+                      const plColor = pl == null ? '#64748B' : pl >= 0 ? '#10B981' : '#EF4444'
+                      const slDist = t.entry_price - t.stop_loss
+                      const tpDist = t.take_profit - t.entry_price
+                      const progress = t.current_price != null
+                        ? Math.max(0, Math.min(100, ((t.current_price - t.stop_loss) / (t.take_profit - t.stop_loss)) * 100))
+                        : null
+                      return (
+                        <div key={t.symbol} style={{ background: '#1E293B', border: `1px solid ${t.exit_notified ? '#F59E0B50' : '#2D3748'}`, borderRadius: 12, padding: '16px 18px' }}>
+                          {t.exit_notified && (
+                            <div style={{ background: '#F59E0B15', border: '1px solid #F59E0B40', borderRadius: 6, padding: '6px 12px', marginBottom: 12, fontSize: 12, color: '#F59E0B' }}>
+                              ⚠️ Exit notification sent — review and close manually below
+                            </div>
+                          )}
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                            <div>
+                              <div style={{ color: '#E2E8F0', fontWeight: 700, fontSize: 16 }}>{t.symbol}</div>
+                              <div style={{ color: '#64748B', fontSize: 12, marginTop: 2 }}>
+                                Entered {new Date(t.entered_at).toLocaleString()} · {t.qty} shares
+                              </div>
+                            </div>
+                            <div style={{ textAlign: 'right' }}>
+                              {pl != null && (
+                                <div style={{ color: plColor, fontWeight: 700, fontSize: 18 }}>
+                                  {pl >= 0 ? '+' : ''}${pl.toFixed(2)}
+                                </div>
+                              )}
+                              {plPct != null && (
+                                <div style={{ color: plColor, fontSize: 13 }}>{plPct >= 0 ? '+' : ''}{plPct.toFixed(2)}%</div>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Price levels */}
+                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 14 }}>
+                            {[
+                              { label: 'Entry', val: t.entry_price, color: '#94A3B8' },
+                              { label: 'Stop Loss', val: t.stop_loss, color: '#EF4444' },
+                              { label: 'Take Profit', val: t.take_profit, color: '#10B981' },
+                              { label: 'Current', val: t.current_price, color: '#3B82F6' },
+                            ].map(({ label, val, color }) => (
+                              <div key={label} style={{ background: '#0F172A', borderRadius: 8, padding: '8px 10px' }}>
+                                <div style={{ color: '#475569', fontSize: 10, marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</div>
+                                <div style={{ color, fontWeight: 600, fontSize: 13 }}>{val != null ? fmt(val) : '—'}</div>
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* SL → TP progress bar */}
+                          {progress != null && (
+                            <div style={{ marginBottom: 14 }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#475569', marginBottom: 4 }}>
+                                <span>SL {fmt(t.stop_loss)}</span>
+                                <span>TP {fmt(t.take_profit)}</span>
+                              </div>
+                              <div style={{ height: 6, background: '#0F172A', borderRadius: 3, overflow: 'hidden' }}>
+                                <div style={{ height: '100%', width: `${progress}%`, background: progress > 66 ? '#10B981' : progress > 33 ? '#F59E0B' : '#EF4444', borderRadius: 3, transition: 'width 0.4s' }} />
+                              </div>
+                            </div>
+                          )}
+
+                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: '#475569' }}>
+                            <span>ATR {fmt(t.atr)}</span>
+                            <span>·</span>
+                            <span>SL dist {fmt(slDist)}</span>
+                            <span>·</span>
+                            <span>TP dist {fmt(tpDist)}</span>
+                            <div style={{ flex: 1 }} />
+                            <button
+                              style={{ background: '#EF444415', border: '1px solid #EF444440', color: '#EF4444', borderRadius: 8, padding: '6px 16px', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}
+                              onClick={() => { if (confirm(`Close ${t.symbol} position now?`)) closeTrendRRTrade(t.symbol) }}
+                            >
+                              Close Position
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
       </main>
     </div>
   )
