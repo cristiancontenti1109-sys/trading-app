@@ -6,6 +6,8 @@ from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -375,3 +377,14 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, user_id)
+
+
+# Serve the React frontend — must be last so API routes take priority
+_FRONTEND = os.path.join(os.path.dirname(__file__), '..', 'web', 'dist')
+if os.path.isdir(_FRONTEND):
+    app.mount('/assets', StaticFiles(directory=os.path.join(_FRONTEND, 'assets')), name='assets')
+
+    @app.get('/{full_path:path}', include_in_schema=False)
+    async def serve_frontend(full_path: str):
+        index = os.path.join(_FRONTEND, 'index.html')
+        return FileResponse(index)
