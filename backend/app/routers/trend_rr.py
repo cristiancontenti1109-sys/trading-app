@@ -39,6 +39,16 @@ async def trigger_scan(
     return {"message": "Trend RR scan started", "active_trades": len(trs._active_trades)}
 
 
+@router.post("/strategy-scan")
+async def run_strategy_scan(
+    strategy: str,
+    timeframe: str = "1D",
+    current_user: User = Depends(get_current_user),
+):
+    picks = await trs.strategy_scan(strategy, timeframe, 10)
+    return {"picks": picks, "total_scanned": len(trs.SCAN_UNIVERSE), "strategy": strategy, "timeframe": timeframe}
+
+
 @router.post("/close/{symbol}")
 async def close_trade(
     symbol: str,

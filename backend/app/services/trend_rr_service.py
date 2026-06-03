@@ -406,6 +406,125 @@ def manual_close_trade(symbol: str) -> dict:
         return {"error": str(e)}
 
 
+async def strategy_scan(strategy: str, timeframe: str, n: int = 10) -> list[dict]:
+    """Scan SCAN_UNIVERSE with any strategy, return top-n by confidence (BUY first)."""
+    from app.services.market_data import fetch_ohlcv
+    from app.services.strategy_service import run_strategy
+
+    results: list[dict] = []
+    BATCH = 5
+
+    async def _analyze(sym: str) -> Optional[dict]:
+        loop = asyncio.get_event_loop()
+        df = await fetch_ohlcv(sym, timeframe, limit=300)
+        if df is None or df.empty:
+            return None
+        result = await loop.run_in_executor(None, lambda: run_strategy(df, sym, timeframe, strategy))
+        if result is None or result.get("recommendation") == "HOLD":
+            return None
+        return result
+
+    for i in range(0, len(SCAN_UNIVERSE), BATCH):
+        batch = SCAN_UNIVERSE[i:i + BATCH]
+        batch_res = await asyncio.gather(*[_analyze(s) for s in batch], return_exceptions=True)
+        for r in batch_res:
+            if isinstance(r, dict):
+                results.append(r)
+        await asyncio.sleep(0.4)
+
+    buys  = sorted([r for r in results if r["recommendation"] == "BUY"],  key=lambda x: x.get("confidence", 0), reverse=True)
+    sells = sorted([r for r in results if r["recommendation"] == "SELL"], key=lambda x: x.get("confidence", 0), reverse=True)
+
+    combined = (buys + sells)[:n]
+    return combined
+
+
+def _score_symbol(symbol: str, df: pd.DataFrame) -> Optional[dict]:
+    """Score a symbol 0-100 for top-picks ranking without placing any order."""
+    if len(df) < EMA_PERIOD + 10:
+        return None
+
+    ema50 = _ema(df["close"], EMA_PERIOD)
+    rsi14 = _rsi(df["close"], RSI_PERIOD)
+    atr14 = _atr(df, ATR_PERIOD)
+
+    last_close = float(df["close"].iloc[-1])
+    last_ema   = float(ema50.iloc[-1])
+    last_rsi   = float(rsi14.iloc[-1])
+    last_atr   = float(atr14.iloc[-1])
+
+    # Hard filters
+    if last_close <= last_ema:           # must be in uptrend
+        return None
+    if not (28 <= last_rsi <= 68):       # avoid overbought / oversold
+        return None
+    if last_atr <= 0:
+        return None
+
+    # Score 1 – RSI proximity to trigger (max 40 pts)
+    # Ideal: RSI sitting just below 45, about to cross
+    rsi_dist = abs(last_rsi - RSI_TRIGGER)
+    rsi_score = max(0.0, 40.0 - rsi_dist * 2.0)
+
+    # Score 2 – RSI momentum, rising in last 5 bars (max 30 pts)
+    rsi_slope = float(rsi14.iloc[-1] - rsi14.iloc[-5]) if len(rsi14) >= 5 else 0.0
+    momentum_score = min(30.0, max(0.0, rsi_slope * 3.0))
+
+    # Score 3 – price just above EMA, not overextended (max 30 pts)
+    pct_above = (last_close - last_ema) / last_ema * 100
+    if pct_above < 1:
+        trend_score = 30.0
+    elif pct_above < 3:
+        trend_score = 22.0
+    elif pct_above < 6:
+        trend_score = 12.0
+    else:
+        trend_score = 4.0
+
+    total = round(rsi_score + momentum_score + trend_score, 1)
+
+    sl_dist    = last_atr * ATR_SL_MULT
+    stop_loss  = round(last_close - sl_dist, 4)
+    take_profit = round(last_close + sl_dist * RR_RATIO, 4)
+
+    return {
+        "symbol":       symbol,
+        "score":        total,
+        "price":        round(last_close, 4),
+        "rsi":          round(last_rsi, 1),
+        "rsi_momentum": round(rsi_slope, 2),
+        "pct_above_ema": round(pct_above, 2),
+        "ema50":        round(last_ema, 4),
+        "atr":          round(last_atr, 4),
+        "stop_loss":    stop_loss,
+        "take_profit":  take_profit,
+    }
+
+
+async def scan_for_top_picks(n: int = 10) -> list[dict]:
+    """Scan full universe, score every symbol, return top-n — no orders placed."""
+    picks: list[dict] = []
+    BATCH = 8
+
+    async def _score_one(sym: str) -> Optional[dict]:
+        loop = asyncio.get_event_loop()
+        df = await loop.run_in_executor(None, lambda: _fetch_bars(sym, 150))
+        if df is None or df.empty:
+            return None
+        return _score_symbol(sym, df)
+
+    for i in range(0, len(SCAN_UNIVERSE), BATCH):
+        batch = SCAN_UNIVERSE[i:i + BATCH]
+        results = await asyncio.gather(*[_score_one(s) for s in batch], return_exceptions=True)
+        for r in results:
+            if isinstance(r, dict):
+                picks.append(r)
+        await asyncio.sleep(0.3)
+
+    picks.sort(key=lambda x: x["score"], reverse=True)
+    return picks[:n]
+
+
 def get_status() -> dict:
     trades_out = []
     for symbol, t in _active_trades.items():

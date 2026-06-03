@@ -3,13 +3,24 @@ import axios from 'axios'
 import { createChart, CandlestickSeries, createSeriesMarkers } from 'lightweight-charts'
 import './App.css'
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8001'
+const API_BASE = import.meta.env.VITE_API_URL
+  || (import.meta.env.DEV ? 'http://localhost:8001' : window.location.origin)
 const api = axios.create({ baseURL: API_BASE })
 api.interceptors.request.use((c) => {
   const t = localStorage.getItem('token')
   if (t) c.headers.Authorization = `Bearer ${t}`
   return c
 })
+api.interceptors.response.use(
+  (r) => r,
+  (e) => {
+    if (e?.response?.status === 401) {
+      localStorage.removeItem('token')
+      window.location.reload()
+    }
+    return Promise.reject(e)
+  }
+)
 
 type Rec = 'BUY' | 'SELL' | 'HOLD'
 interface Signal {
@@ -222,9 +233,18 @@ export default function App() {
     }
     trades: TrendRRTrade[]
   }
+  interface StrategyScanPick {
+    symbol: string; recommendation: Rec; confidence: number
+    entry_zone: { low: number; high: number }; target_price: number; stop_loss: number
+    tp1?: number; tp2?: number; tp3?: number; reasoning: string[]
+  }
+
   const [trendRR, setTrendRR] = useState<TrendRRStatus | null>(null)
   const [trendRRLoading, setTrendRRLoading] = useState(false)
   const [trendRRScanning, setTrendRRScanning] = useState(false)
+  const [trendRRStrategy, setTrendRRStrategy] = useState<StrategyKey>('ema_crossover')
+  const [trendRRTf, setTrendRRTf] = useState('1D')
+  const [scanPicks, setScanPicks] = useState<StrategyScanPick[] | null>(null)
 
   const loadTrendRR = useCallback(async () => {
     setTrendRRLoading(true)
@@ -232,10 +252,20 @@ export default function App() {
     setTrendRRLoading(false)
   }, [])
 
+  const [scanError, setScanError] = useState<string | null>(null)
+
   const triggerTrendRRScan = async () => {
     setTrendRRScanning(true)
-    try { await api.post('/trend-rr/scan') } catch {}
-    setTimeout(() => { loadTrendRR(); setTrendRRScanning(false) }, 2000)
+    setScanPicks(null)
+    setScanError(null)
+    try {
+      const res = await api.post(`/trend-rr/strategy-scan?strategy=${trendRRStrategy}&timeframe=${trendRRTf}`)
+      setScanPicks(res.data.picks)
+    } catch (e: any) {
+      setScanError(e?.response?.data?.detail || 'Scan failed — check that the backend is running')
+    }
+    await loadTrendRR()
+    setTrendRRScanning(false)
   }
 
   const closeTrendRRTrade = async (symbol: string) => {
@@ -555,7 +585,7 @@ export default function App() {
             Journal {openTrades.length > 0 && <span className="badge-count">{openTrades.length}</span>}
           </button>
           <button className={`main-tab ${mainView === 'trendrr' ? 'active' : ''}`} onClick={() => setMainView('trendrr')}>
-            Trend RR {trendRR && trendRR.active_trades > 0 && <span className="badge-count">{trendRR.active_trades}</span>}
+            Trend RR
           </button>
         </div>
 
@@ -1262,7 +1292,30 @@ export default function App() {
                   EMA-50 trend filter · RSI-14 pullback entry · 1% risk sizing · Manual exit approval
                 </div>
               </div>
-              <div style={{ display: 'flex', gap: 10 }}>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                {/* Strategy selector */}
+                <div className="strategy-select-wrap">
+                  <select className="strategy-select" value={trendRRStrategy} onChange={e => setTrendRRStrategy(e.target.value as StrategyKey)}>
+                    {(['Price Action', 'Trend', 'Momentum', 'Volatility', 'Institutional'] as const).map(cat => {
+                      const items = STRATEGIES.filter(s => s.category === cat)
+                      return items.length ? (
+                        <optgroup key={cat} label={cat}>
+                          {items.map(s => <option key={s.key} value={s.key}>{s.label}</option>)}
+                        </optgroup>
+                      ) : null
+                    })}
+                  </select>
+                  <span className="strategy-select-arrow">▾</span>
+                </div>
+                {/* Timeframe selector */}
+                <div style={{ display: 'flex', gap: 4 }}>
+                  {TFS.map(t => (
+                    <button key={t} onClick={() => setTrendRRTf(t)}
+                      style={{ padding: '5px 10px', fontSize: 12, borderRadius: 6, border: '1px solid', cursor: 'pointer', fontWeight: trendRRTf === t ? 700 : 400, background: trendRRTf === t ? '#3B82F6' : '#1E293B', borderColor: trendRRTf === t ? '#3B82F6' : '#334155', color: trendRRTf === t ? '#fff' : '#94A3B8' }}>
+                      {t}
+                    </button>
+                  ))}
+                </div>
                 <button className="btn-primary" style={{ fontSize: 13, padding: '8px 18px' }}
                   disabled={trendRRScanning}
                   onClick={triggerTrendRRScan}>
@@ -1317,99 +1370,99 @@ export default function App() {
                   When price reaches either level a <strong>push notification</strong> is sent — you review and manually close.
                 </div>
 
-                {/* Active trades */}
-                <div style={{ color: '#94A3B8', fontSize: 13, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 12 }}>
-                  Active Trades ({trendRR.active_trades})
-                </div>
+                {/* Strategy Scan Results */}
+                {(trendRRScanning || scanPicks || scanError) && (
+                  <div style={{ marginBottom: 32 }}>
+                    <div style={{ color: '#94A3B8', fontSize: 13, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 12 }}>
+                      Top 10 Setups
+                      {scanPicks && <span style={{ color: '#64748B', fontWeight: 400, fontSize: 12, textTransform: 'none', marginLeft: 8 }}>
+                        — {STRATEGIES.find(s => s.key === trendRRStrategy)?.label} · {trendRRTf} · ranked by confidence
+                      </span>}
+                    </div>
 
-                {trendRR.trades.length === 0 ? (
-                  <div style={{ background: '#1E293B', border: '1px solid #2D3748', borderRadius: 10, padding: '32px 20px', textAlign: 'center', color: '#4A5568', fontSize: 14 }}>
-                    No active trades — run a scan or wait for the next automatic cycle
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                    {trendRR.trades.map(t => {
-                      const pl = t.unrealized_pnl
-                      const plPct = t.unrealized_pnl_pct
-                      const plColor = pl == null ? '#64748B' : pl >= 0 ? '#10B981' : '#EF4444'
-                      const slDist = t.entry_price - t.stop_loss
-                      const tpDist = t.take_profit - t.entry_price
-                      const progress = t.current_price != null
-                        ? Math.max(0, Math.min(100, ((t.current_price - t.stop_loss) / (t.take_profit - t.stop_loss)) * 100))
-                        : null
-                      return (
-                        <div key={t.symbol} style={{ background: '#1E293B', border: `1px solid ${t.exit_notified ? '#F59E0B50' : '#2D3748'}`, borderRadius: 12, padding: '16px 18px' }}>
-                          {t.exit_notified && (
-                            <div style={{ background: '#F59E0B15', border: '1px solid #F59E0B40', borderRadius: 6, padding: '6px 12px', marginBottom: 12, fontSize: 12, color: '#F59E0B' }}>
-                              ⚠️ Exit notification sent — review and close manually below
-                            </div>
-                          )}
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
-                            <div>
-                              <div style={{ color: '#E2E8F0', fontWeight: 700, fontSize: 16 }}>{t.symbol}</div>
-                              <div style={{ color: '#64748B', fontSize: 12, marginTop: 2 }}>
-                                Entered {new Date(t.entered_at).toLocaleString()} · {t.qty} shares
+                    {trendRRScanning && (
+                      <div style={{ background: '#1E293B', border: '1px solid #2D3748', borderRadius: 10, padding: '28px 20px', textAlign: 'center', color: '#64748B', fontSize: 14 }}>
+                        <span className="spinner" style={{ width: 16, height: 16, borderWidth: 2, display: 'inline-block', marginRight: 10, verticalAlign: 'middle' }} />
+                        Scanning {trendRR?.config.scan_universe.length ?? '—'} symbols with {STRATEGIES.find(s => s.key === trendRRStrategy)?.label}…
+                      </div>
+                    )}
+
+                    {!trendRRScanning && scanError && (
+                      <div style={{ background: '#EF444415', border: '1px solid #EF444440', borderRadius: 10, padding: '16px 20px', color: '#EF4444', fontSize: 13 }}>
+                        {scanError}
+                      </div>
+                    )}
+
+                    {!trendRRScanning && scanPicks && scanPicks.length === 0 && (
+                      <div style={{ background: '#1E293B', border: '1px solid #2D3748', borderRadius: 10, padding: '28px 20px', textAlign: 'center', color: '#4A5568', fontSize: 14 }}>
+                        No actionable setups found — try a different strategy or timeframe
+                      </div>
+                    )}
+
+                    {!trendRRScanning && scanPicks && scanPicks.length > 0 && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        {scanPicks.map((p, i) => {
+                          const rec = p.recommendation
+                          const recColor = REC_COLOR[rec]
+                          const pct = Math.round(p.confidence * 100)
+                          const pick = fillTPs(p)
+                          return (
+                            <div key={p.symbol} style={{ background: '#1E293B', border: `1px solid ${i === 0 ? recColor + '50' : '#2D3748'}`, borderRadius: 10, padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                              {/* Rank */}
+                              <div style={{ width: 28, height: 28, borderRadius: '50%', border: `2px solid ${i === 0 ? '#F59E0B' : i === 1 ? '#94A3B8' : i === 2 ? '#CD7F32' : '#2D3748'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: i === 0 ? '#F59E0B' : i === 1 ? '#94A3B8' : i === 2 ? '#CD7F32' : '#64748B', fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
+                                {i + 1}
                               </div>
-                            </div>
-                            <div style={{ textAlign: 'right' }}>
-                              {pl != null && (
-                                <div style={{ color: plColor, fontWeight: 700, fontSize: 18 }}>
-                                  {pl >= 0 ? '+' : ''}${pl.toFixed(2)}
+
+                              {/* Symbol + signal */}
+                              <div style={{ minWidth: 80 }}>
+                                <div style={{ color: '#E2E8F0', fontWeight: 700, fontSize: 15 }}>{p.symbol}</div>
+                                <div style={{ color: recColor, fontSize: 11, fontWeight: 600 }}>{rec}</div>
+                              </div>
+
+                              {/* Confidence bar */}
+                              <div style={{ minWidth: 70 }}>
+                                <div style={{ color: recColor, fontWeight: 700, fontSize: 16 }}>{pct}%</div>
+                                <div style={{ height: 4, background: '#0F172A', borderRadius: 2, marginTop: 4, width: 60 }}>
+                                  <div style={{ height: '100%', width: `${pct}%`, background: recColor, borderRadius: 2 }} />
+                                </div>
+                              </div>
+
+                              {/* Entry zone */}
+                              <div style={{ minWidth: 90 }}>
+                                <div style={{ color: '#E2E8F0', fontSize: 12 }}>${fmt(p.entry_zone.low)} – ${fmt(p.entry_zone.high)}</div>
+                                <div style={{ color: '#475569', fontSize: 10 }}>Entry Zone</div>
+                              </div>
+
+                              {/* SL / TP */}
+                              <div style={{ flex: 1, display: 'flex', gap: 12, justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                                <div style={{ textAlign: 'right' }}>
+                                  <div style={{ color: '#EF4444', fontSize: 12, fontWeight: 600 }}>${fmt(p.stop_loss)}</div>
+                                  <div style={{ color: '#475569', fontSize: 10 }}>Stop Loss</div>
+                                </div>
+                                <div style={{ textAlign: 'right' }}>
+                                  <div style={{ color: '#10B981', fontSize: 12, fontWeight: 600 }}>${fmt(pick.tp1)}</div>
+                                  <div style={{ color: '#475569', fontSize: 10 }}>TP1</div>
+                                </div>
+                                <div style={{ textAlign: 'right' }}>
+                                  <div style={{ color: '#10B981', fontSize: 12, fontWeight: 600 }}>${fmt(pick.tp2)}</div>
+                                  <div style={{ color: '#475569', fontSize: 10 }}>TP2</div>
+                                </div>
+                              </div>
+
+                              {/* Top reasoning */}
+                              {p.reasoning?.[0] && (
+                                <div style={{ width: '100%', color: '#64748B', fontSize: 11, marginTop: 4, borderTop: '1px solid #1E293B', paddingTop: 8 }}>
+                                  {p.reasoning[0]}
                                 </div>
                               )}
-                              {plPct != null && (
-                                <div style={{ color: plColor, fontSize: 13 }}>{plPct >= 0 ? '+' : ''}{plPct.toFixed(2)}%</div>
-                              )}
                             </div>
-                          </div>
-
-                          {/* Price levels */}
-                          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 14 }}>
-                            {[
-                              { label: 'Entry', val: t.entry_price, color: '#94A3B8' },
-                              { label: 'Stop Loss', val: t.stop_loss, color: '#EF4444' },
-                              { label: 'Take Profit', val: t.take_profit, color: '#10B981' },
-                              { label: 'Current', val: t.current_price, color: '#3B82F6' },
-                            ].map(({ label, val, color }) => (
-                              <div key={label} style={{ background: '#0F172A', borderRadius: 8, padding: '8px 10px' }}>
-                                <div style={{ color: '#475569', fontSize: 10, marginBottom: 2, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</div>
-                                <div style={{ color, fontWeight: 600, fontSize: 13 }}>{val != null ? fmt(val) : '—'}</div>
-                              </div>
-                            ))}
-                          </div>
-
-                          {/* SL → TP progress bar */}
-                          {progress != null && (
-                            <div style={{ marginBottom: 14 }}>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#475569', marginBottom: 4 }}>
-                                <span>SL {fmt(t.stop_loss)}</span>
-                                <span>TP {fmt(t.take_profit)}</span>
-                              </div>
-                              <div style={{ height: 6, background: '#0F172A', borderRadius: 3, overflow: 'hidden' }}>
-                                <div style={{ height: '100%', width: `${progress}%`, background: progress > 66 ? '#10B981' : progress > 33 ? '#F59E0B' : '#EF4444', borderRadius: 3, transition: 'width 0.4s' }} />
-                              </div>
-                            </div>
-                          )}
-
-                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, color: '#475569' }}>
-                            <span>ATR {fmt(t.atr)}</span>
-                            <span>·</span>
-                            <span>SL dist {fmt(slDist)}</span>
-                            <span>·</span>
-                            <span>TP dist {fmt(tpDist)}</span>
-                            <div style={{ flex: 1 }} />
-                            <button
-                              style={{ background: '#EF444415', border: '1px solid #EF444440', color: '#EF4444', borderRadius: 8, padding: '6px 16px', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}
-                              onClick={() => { if (confirm(`Close ${t.symbol} position now?`)) closeTrendRRTrade(t.symbol) }}
-                            >
-                              Close Position
-                            </button>
-                          </div>
-                        </div>
-                      )
-                    })}
+                          )
+                        })}
+                      </div>
+                    )}
                   </div>
                 )}
+
               </>
             )}
           </div>

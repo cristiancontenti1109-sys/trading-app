@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -375,4 +377,21 @@ async def websocket_endpoint(
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, user_id)
+
+
+# ── Serve React frontend ──────────────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FRONTEND = (
+    os.path.join(_HERE, "frontend_dist")           # Render / production build
+    if os.path.isdir(os.path.join(_HERE, "frontend_dist"))
+    else os.path.join(_HERE, "..", "web", "dist")  # local dev fallback
+)
+if os.path.isdir(_FRONTEND):
+    _assets = os.path.join(_FRONTEND, "assets")
+    if os.path.isdir(_assets):
+        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str):
+        return FileResponse(os.path.join(_FRONTEND, "index.html"))
 
