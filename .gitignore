@@ -13,6 +13,8 @@ web/node_modules/
 web/dist/
 web/release/
 web/.capacitor/
+mobile/node_modules/
+node_modules/
 
 # macOS
 .DS_Store
