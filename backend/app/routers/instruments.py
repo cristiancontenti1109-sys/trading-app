@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -6,9 +6,27 @@ from app.database import get_db
 from app.models.instrument import Instrument
 from app.models.user import User
 from app.routers.auth import get_current_user
-from app.services.market_data import fetch_current_price
+from app.services.market_data import fetch_current_price, fetch_prices_batch
 
 router = APIRouter(prefix="/instruments", tags=["instruments"])
+
+
+@router.get("/prices")
+async def get_prices_batch(
+    symbols: str = Query(..., description="Comma-separated list of symbols"),
+    current_user: User = Depends(get_current_user),
+):
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    prices = await fetch_prices_batch(symbol_list)
+    return prices
+
+
+@router.get("/{symbol}/price")
+async def get_price(symbol: str, current_user: User = Depends(get_current_user)):
+    price = await fetch_current_price(symbol)
+    if price is None:
+        raise HTTPException(status_code=404, detail="Price not available")
+    return {"symbol": symbol, "price": price}
 
 
 @router.get("/{symbol}")
@@ -38,11 +56,3 @@ async def get_instrument(
         "last_price": instrument.last_price,
         "last_updated": instrument.last_updated.isoformat() if instrument.last_updated else None,
     }
-
-
-@router.get("/{symbol}/price")
-async def get_price(symbol: str, current_user: User = Depends(get_current_user)):
-    price = await fetch_current_price(symbol)
-    if price is None:
-        raise HTTPException(status_code=404, detail="Price not available")
-    return {"symbol": symbol, "price": price}

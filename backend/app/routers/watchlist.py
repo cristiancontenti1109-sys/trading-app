@@ -59,14 +59,6 @@ async def add_to_watchlist(
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Already in watchlist")
 
-    # Free tier limit: 5 instruments
-    if current_user.subscription_tier == "free":
-        count_result = await db.execute(
-            select(WatchlistItem).where(WatchlistItem.user_id == current_user.id)
-        )
-        if len(count_result.scalars().all()) >= 5:
-            raise HTTPException(status_code=403, detail="Free tier limit: 5 instruments. Upgrade to Pro.")
-
     # Ensure instrument exists in catalog
     inst_result = await db.execute(select(Instrument).where(Instrument.symbol == data.symbol))
     if not inst_result.scalar_one_or_none():

@@ -1,14 +1,18 @@
+# Python
 backend/.venv/
 backend/__pycache__/
 backend/build/
 backend/dist/
-backend/trading.db
 backend/*.db
 backend/.env
+**/__pycache__/
+*.pyc
 
+# Node
 web/node_modules/
 web/dist/
 web/release/
+web/.capacitor/
 
-*.pyc
+# macOS
 .DS_Store

@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     binance_secret_key: Optional[str] = None
     oanda_api_key: Optional[str] = None
     tradingview_webhook_secret: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    alpaca_api_key: Optional[str] = None
+    alpaca_secret_key: Optional[str] = None
+    alpaca_base_url: str = "https://paper-api.alpaca.markets"
     expo_push_token_base_url: str = "https://exp.host/--/api/v2/push/send"
     environment: str = "development"
     access_token_expire_minutes: int = 60 * 24 * 7  # 7 days

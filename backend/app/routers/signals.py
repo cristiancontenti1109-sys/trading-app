@@ -25,7 +25,7 @@ async def get_signal(
     """Get the latest signal for a symbol. Generates fresh if none cached recently."""
     # Try cached signal first (last 30 minutes)
     from datetime import datetime, timedelta
-    cutoff = datetime.utcnow() - timedelta(minutes=30)
+    cutoff = datetime.utcnow() - timedelta(minutes=10)
     result = await db.execute(
         select(Signal)
         .where(Signal.symbol == symbol, Signal.timeframe == timeframe, Signal.created_at > cutoff)
@@ -110,6 +110,56 @@ async def get_ohlcv(
             for ts, row in df.iterrows()
         ],
     }
+
+
+@router.get("/{symbol}/strategy")
+async def get_strategy_signal(
+    symbol: str,
+    strategy: str = Query(..., enum=[
+        "fibonacci", "smart_money", "elliott_wave", "warren_buffett", "jpmorgan",
+        "macd_crossover", "rsi_divergence", "bb_squeeze",
+        "support_resistance", "ema_crossover", "ichimoku", "stochastic", "vwap",
+    ]),
+    timeframe: str = Query("4h", enum=TIMEFRAMES),
+    current_user: User = Depends(get_current_user),
+):
+    """Run a specific named strategy on live OHLCV data."""
+    from app.services.strategy_service import run_strategy
+    df = await fetch_ohlcv(symbol, timeframe, 200)
+    if df is None or df.empty:
+        raise HTTPException(status_code=404, detail=f"No market data for {symbol}")
+    result = run_strategy(df, symbol, timeframe, strategy)
+    if result is None:
+        raise HTTPException(status_code=422, detail="Insufficient data for strategy analysis")
+    return result
+
+
+@router.post("/{symbol}/custom")
+async def run_custom_strategy(
+    symbol: str,
+    params: dict,
+    timeframe: str = Query("4h", enum=TIMEFRAMES),
+    current_user: User = Depends(get_current_user),
+):
+    """Run user-defined custom strategy with configurable parameters."""
+    from app.services.signal_service import run_custom_strategy
+    df = await fetch_ohlcv(symbol, timeframe, 300)
+    if df is None or df.empty:
+        raise HTTPException(status_code=404, detail=f"No market data for {symbol}")
+    result = run_custom_strategy(
+        df, symbol, timeframe,
+        fast_ema=int(params.get("fast_ema", 9)),
+        slow_ema=int(params.get("slow_ema", 21)),
+        rsi_period=int(params.get("rsi_period", 14)),
+        rsi_oversold=float(params.get("rsi_oversold", 30)),
+        rsi_overbought=float(params.get("rsi_overbought", 70)),
+        require_macd=bool(params.get("require_macd", True)),
+        require_volume=bool(params.get("require_volume", False)),
+        atr_multiplier=float(params.get("atr_multiplier", 1.5)),
+    )
+    if result is None:
+        raise HTTPException(status_code=422, detail="Insufficient data for custom strategy")
+    return result
 
 
 @router.get("/{symbol}/news")
