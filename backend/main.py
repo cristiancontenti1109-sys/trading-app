@@ -16,13 +16,9 @@ from app.config import settings
 from app.database import init_db, get_db, AsyncSessionLocal
 from app.models import User, Instrument, WatchlistItem
 from app.routers import auth, watchlist, signals, instruments, trades, chat
-from app.routers import alpaca as alpaca_router
 from app.routers import smc as smc_router
-from app.routers import auto_trading as auto_trading_router
 from app.routers import trend_rr as trend_rr_router
 from app.services.smc_service import generate_smc_signal, smc_signal_to_dict
-from app.services.auto_trading_service import run_morning_scan, run_afternoon_scan, notify_eod_review
-from app.services.trend_rr_service import run_scan as trend_rr_scan, run_eod_scan as trend_rr_eod
 from app.websocket.manager import manager
 from app.services.market_data import fetch_ohlcv, fetch_current_price
 from app.services.signal_service import generate_signal
@@ -254,44 +250,6 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(run_signal_pipeline, "interval", minutes=15, id="signal_pipeline")
     scheduler.add_job(run_price_updates, "interval", seconds=30, id="price_updates")
     scheduler.add_job(run_smc_scan, "interval", minutes=15, id="smc_scan")
-    # Trend RR — scan every 30 min during US market hours (Mon–Fri 09:35–15:30 ET)
-    # Scans at :05 and :35 past each hour so they don't collide with other jobs
-    for _hour in range(9, 16):
-        _start_min = 35 if _hour == 9 else 5
-        for _min in [_start_min, _start_min + 30]:
-            if _min >= 60 or (_hour == 15 and _min > 30):
-                continue
-            scheduler.add_job(
-                trend_rr_scan, "cron",
-                day_of_week="mon-fri", hour=_hour, minute=_min,
-                timezone="America/New_York",
-                id=f"trend_rr_{_hour:02d}{_min:02d}",
-            )
-    # EOD position review at 15:45 ET
-    scheduler.add_job(
-        trend_rr_eod, "cron",
-        day_of_week="mon-fri", hour=15, minute=45,
-        timezone="America/New_York",
-        id="trend_rr_eod",
-    )
-
-    # Auto-trading schedule (US Eastern Time)
-    scheduler.add_job(
-        run_morning_scan, "cron",
-        hour=9, minute=35, timezone="America/New_York",
-        id="auto_morning_scan",
-    )
-    scheduler.add_job(
-        run_afternoon_scan, "cron",
-        hour=15, minute=15, timezone="America/New_York",
-        id="auto_afternoon_scan",
-    )
-    scheduler.add_job(
-        notify_eod_review, "cron",
-        hour=15, minute=45, timezone="America/New_York",
-        id="auto_eod_notify",
-    )
-
     # Keep-alive ping — prevents Render free tier from sleeping
     async def _self_ping():
         import aiohttp
@@ -333,9 +291,7 @@ app.include_router(signals.router)
 app.include_router(instruments.router)
 app.include_router(trades.router)
 app.include_router(chat.router)
-app.include_router(alpaca_router.router)
 app.include_router(smc_router.router)
-app.include_router(auto_trading_router.router)
 app.include_router(trend_rr_router.router)
 
 
