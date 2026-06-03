@@ -11,7 +11,8 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.9
 httpx==0.27.0
-yfinance>=0.2.40
+yfinance==0.2.50
+websocket-client>=1.7.0
 pandas>=2.0.0
 numpy>=1.24.0
 aiohttp==3.9.5
