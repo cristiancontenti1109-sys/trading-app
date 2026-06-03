@@ -6,7 +6,7 @@ _is_postgres = settings.database_url.startswith("postgresql")
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    connect_args={"ssl": "require"} if _is_postgres else {},
+    connect_args={"ssl": True} if _is_postgres else {},
 )
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
