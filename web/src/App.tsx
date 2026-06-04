@@ -538,22 +538,28 @@ export default function App() {
           <div style={{ padding: '8px 12px' }}>
             <input className="input" style={{ marginBottom: 8 }} placeholder="BTC, AAPL, EUR..." value={search} onChange={e => setSearch(e.target.value)} autoFocus />
             {addError && <div className="add-error">{addError}</div>}
-            {searchResults.map(r => (
-              <div key={r.symbol} className="list-row" onClick={async () => {
-                try {
-                  await api.post('/watchlist/', { symbol: r.symbol })
-                  setAddError(''); loadWatchlist(); setSideTab('watchlist')
-                } catch (e: any) {
-                  const msg = e.response?.data?.detail || 'Could not add instrument'
-                  setAddError(msg)
-                  setTimeout(() => setAddError(''), 4000)
-                }
-              }}>
-                <span className="dot" style={{ background: ASSET_COLOR[r.asset_class] }} />
-                <div style={{ flex: 1 }}><div className="sym">{r.symbol}</div><div className="label-sm">{r.name}</div></div>
-                <span className="add-btn">+</span>
-              </div>
-            ))}
+            {searchResults.map(r => {
+              const alreadyAdded = watchlist.some(w => w.symbol === r.symbol)
+              return (
+                <div key={r.symbol} className="list-row" onClick={async () => {
+                  if (alreadyAdded) { setSearch(''); setSideTab('watchlist'); return }
+                  try {
+                    await api.post('/watchlist/', { symbol: r.symbol })
+                    setAddError(''); loadWatchlist(); setSideTab('watchlist')
+                  } catch (e: any) {
+                    const msg = e.response?.data?.detail || 'Could not add instrument'
+                    setAddError(msg)
+                    setTimeout(() => setAddError(''), 4000)
+                  }
+                }}>
+                  <span className="dot" style={{ background: ASSET_COLOR[r.asset_class] }} />
+                  <div style={{ flex: 1 }}><div className="sym">{r.symbol}</div><div className="label-sm">{r.name}</div></div>
+                  <span className="add-btn" style={alreadyAdded ? { color: 'var(--green)', fontSize: 16 } : {}}>
+                    {alreadyAdded ? '✓' : '+'}
+                  </span>
+                </div>
+              )
+            })}
           </div>
         ) : (
           <div>
