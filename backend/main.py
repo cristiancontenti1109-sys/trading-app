@@ -246,7 +246,7 @@ async def seed_default_user():
     """Create a default admin account on first boot if no users exist."""
     from app.routers.auth import hash_password
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(User))
+        result = await db.execute(select(User).limit(1))
         if result.scalar_one_or_none() is None:
             admin = User(
                 email="admin@trading.com",

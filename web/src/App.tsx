@@ -285,13 +285,13 @@ export default function App() {
 
   const loadWatchlist = useCallback(async () => {
     try {
-      const [wlRes, meRes] = await Promise.all([
-        api.get('/watchlist/'),
-        api.get('/auth/me'),
-      ])
-      setWatchlist(wlRes.data)
-      setCurrentUserEmail(meRes.data.email || '')
-    } catch (e) { console.error('WATCHLIST/ME ERROR:', e) }
+      const res = await api.get('/watchlist/')
+      setWatchlist(res.data)
+    } catch (e) { console.error('WATCHLIST ERROR:', e) }
+    try {
+      const me = await api.get('/auth/me')
+      setCurrentUserEmail(me.data.email || '')
+    } catch {}
   }, [])
 
   const loadTrades = useCallback(async () => {
