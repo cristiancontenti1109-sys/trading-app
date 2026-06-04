@@ -22,25 +22,27 @@ async def get_watchlist(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(WatchlistItem, Instrument)
-        .join(Instrument, WatchlistItem.symbol == Instrument.symbol)
+    items_result = await db.execute(
+        select(WatchlistItem)
         .where(WatchlistItem.user_id == current_user.id)
         .order_by(WatchlistItem.pinned.desc(), WatchlistItem.added_at)
     )
-    rows = result.all()
-    return [
-        {
+    items = items_result.scalars().all()
+
+    out = []
+    for item in items:
+        inst_result = await db.execute(select(Instrument).where(Instrument.symbol == item.symbol))
+        inst = inst_result.scalar_one_or_none()
+        out.append({
             "id": item.id,
             "symbol": item.symbol,
             "pinned": item.pinned,
             "added_at": item.added_at.isoformat(),
-            "name": instrument.name,
-            "asset_class": instrument.asset_class,
-            "last_price": instrument.last_price,
-        }
-        for item, instrument in rows
-    ]
+            "name": inst.name if inst else item.symbol,
+            "asset_class": inst.asset_class if inst else "stocks",
+            "last_price": inst.last_price if inst else None,
+        })
+    return out
 
 
 @router.post("/")

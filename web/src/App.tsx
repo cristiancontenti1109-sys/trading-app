@@ -241,6 +241,7 @@ export default function App() {
 
   const [trendRR, setTrendRR] = useState<TrendRRStatus | null>(null)
   const [trendRRLoading, setTrendRRLoading] = useState(false)
+  const [currentUserEmail, setCurrentUserEmail] = useState('')
   const [trendRRScanning, setTrendRRScanning] = useState(false)
   const [trendRRStrategy, setTrendRRStrategy] = useState<StrategyKey>('ema_crossover')
   const [trendRRTf, setTrendRRTf] = useState('1D')
@@ -283,7 +284,14 @@ export default function App() {
   const signalLoadTrigger = useRef(0)
 
   const loadWatchlist = useCallback(async () => {
-    try { setWatchlist((await api.get('/watchlist/')).data) } catch {}
+    try {
+      const [wlRes, meRes] = await Promise.all([
+        api.get('/watchlist/'),
+        api.get('/auth/me'),
+      ])
+      setWatchlist(wlRes.data)
+      setCurrentUserEmail(meRes.data.email || '')
+    } catch (e) { console.error('WATCHLIST/ME ERROR:', e) }
   }, [])
 
   const loadTrades = useCallback(async () => {
@@ -525,10 +533,13 @@ export default function App() {
       <aside className="sidebar">
         <div className="sidebar-header">
           <div className="sidebar-brand"><span className="brand-mark">TS</span> TradingSignals</div>
-          <button className="btn-link" style={{ fontSize: 12 }} onClick={() => { localStorage.removeItem('token'); setToken(null) }}>Logout</button>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
+            {currentUserEmail && <div style={{ fontSize: 9, color: 'var(--text3)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentUserEmail}</div>}
+            <button className="btn-link" style={{ fontSize: 12 }} onClick={() => { localStorage.removeItem('token'); setToken(null); setCurrentUserEmail('') }}>Logout</button>
+          </div>
         </div>
         <div className="tab-row">
-          <button className={`tab ${sideTab === 'watchlist' ? 'active' : ''}`} onClick={() => setSideTab('watchlist')}>Watchlist</button>
+          <button className={`tab ${sideTab === 'watchlist' ? 'active' : ''}`} onClick={() => { setSideTab('watchlist'); loadWatchlist() }}>Watchlist</button>
           <button className={`tab ${sideTab === 'search' ? 'active' : ''}`} onClick={() => setSideTab('search')}>+ Add</button>
         </div>
         {sideTab === 'watchlist' && lastPriceUpdate && (
@@ -545,11 +556,20 @@ export default function App() {
                   if (alreadyAdded) { setSearch(''); setSideTab('watchlist'); return }
                   try {
                     await api.post('/watchlist/', { symbol: r.symbol })
-                    setAddError(''); loadWatchlist(); setSideTab('watchlist')
+                    setAddError('')
+                    setSearch('')
+                    await loadWatchlist()
+                    setSideTab('watchlist')
                   } catch (e: any) {
                     const msg = e.response?.data?.detail || 'Could not add instrument'
-                    setAddError(msg)
-                    setTimeout(() => setAddError(''), 4000)
+                    if (msg === 'Already in watchlist') {
+                      await loadWatchlist()
+                      setSearch('')
+                      setSideTab('watchlist')
+                    } else {
+                      setAddError(msg)
+                      setTimeout(() => setAddError(''), 4000)
+                    }
                   }
                 }}>
                   <span className="dot" style={{ background: ASSET_COLOR[r.asset_class] }} />
