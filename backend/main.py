@@ -242,10 +242,26 @@ async def run_price_updates():
             await manager.broadcast_price(symbol, price, 0.0)
 
 
+async def seed_default_user():
+    """Create a default admin account on first boot if no users exist."""
+    from app.routers.auth import hash_password
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User))
+        if result.scalar_one_or_none() is None:
+            admin = User(
+                email="admin@trading.com",
+                hashed_password=hash_password("trading123"),
+            )
+            db.add(admin)
+            await db.commit()
+            logger.info("Default user created: admin@trading.com / trading123")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     await seed_instruments()
+    await seed_default_user()
 
     scheduler.add_job(run_signal_pipeline, "interval", minutes=15, id="signal_pipeline")
     scheduler.add_job(run_price_updates, "interval", seconds=30, id="price_updates")
