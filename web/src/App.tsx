@@ -553,7 +553,7 @@ export default function App() {
               const alreadyAdded = watchlist.some(w => w.symbol === r.symbol)
               return (
                 <div key={r.symbol} className="list-row" onClick={async () => {
-                  if (alreadyAdded) { setSearch(''); setSideTab('watchlist'); return }
+                  if (alreadyAdded) { await loadWatchlist(); setSearch(''); setSideTab('watchlist'); return }
                   try {
                     await api.post('/watchlist/', { symbol: r.symbol })
                     setAddError('')
