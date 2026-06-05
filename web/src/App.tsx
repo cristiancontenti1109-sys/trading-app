@@ -553,24 +553,20 @@ export default function App() {
               const alreadyAdded = watchlist.some(w => w.symbol === r.symbol)
               return (
                 <div key={r.symbol} className="list-row" onClick={async () => {
-                  if (alreadyAdded) { await loadWatchlist(); setSearch(''); setSideTab('watchlist'); return }
                   try {
                     await api.post('/watchlist/', { symbol: r.symbol })
-                    setAddError('')
-                    setSearch('')
-                    await loadWatchlist()
-                    setSideTab('watchlist')
                   } catch (e: any) {
-                    const msg = e.response?.data?.detail || 'Could not add instrument'
-                    if (msg === 'Already in watchlist') {
-                      await loadWatchlist()
-                      setSearch('')
-                      setSideTab('watchlist')
-                    } else {
-                      setAddError(msg)
+                    const msg = e.response?.data?.detail || ''
+                    if (msg !== 'Already in watchlist') {
+                      setAddError(msg || 'Could not add instrument')
                       setTimeout(() => setAddError(''), 4000)
+                      return
                     }
                   }
+                  setAddError('')
+                  setSearch('')
+                  await loadWatchlist()
+                  setSideTab('watchlist')
                 }}>
                   <span className="dot" style={{ background: ASSET_COLOR[r.asset_class] }} />
                   <div style={{ flex: 1 }}><div className="sym">{r.symbol}</div><div className="label-sm">{r.name}</div></div>
